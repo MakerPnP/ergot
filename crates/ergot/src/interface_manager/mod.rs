@@ -101,6 +101,9 @@ pub trait Profile {
     /// The kind of type that is used to identify a single interface.
     /// If a Profile only supports a single interface, this is often the `()` type.
     /// If a Profile supports many interfaces, this could be an enum or integer type.
+    #[cfg(feature = "defmt-v1")]
+    type InterfaceIdent: Clone + core::fmt::Debug + defmt::Format;
+    #[cfg(not(feature = "defmt-v1"))]
     type InterfaceIdent: Clone + core::fmt::Debug;
 
     /// Send a serializable message to the Profile.
