@@ -56,6 +56,7 @@ pub struct Header {
     pub ttl: u8,
 }
 
+#[cfg_attr(feature = "defmt-v1", derive(defmt::Format))]
 #[derive(Debug, Clone)]
 pub struct HeaderSeq {
     pub src: Address,
