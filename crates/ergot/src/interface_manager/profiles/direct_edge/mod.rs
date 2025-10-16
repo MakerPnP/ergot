@@ -10,10 +10,7 @@
 //! any outgoing packets, rather than trying to determine whether that packet is
 //! actually routable to a node on the network.
 
-#[cfg(feature = "defmt-v1")]
-use defmt::{debug, trace, warn};
-#[cfg(not(feature = "defmt-v1"))]
-use log::{debug, trace, warn};
+use crate::logging::{debug, trace, warn};
 
 use serde::Serialize;
 

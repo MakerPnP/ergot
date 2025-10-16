@@ -1,11 +1,9 @@
 use core::{any::TypeId, ptr::NonNull};
 
 use cordyceps::List;
-#[cfg(feature = "defmt-v1")]
-use defmt::{debug, trace};
-#[cfg(not(feature = "defmt-v1"))]
-use log::{debug, trace};
 use serde::Serialize;
+
+use crate::logging::{debug, trace};
 
 use crate::{
     FrameKind, Header, HeaderSeq, ProtocolError,
