@@ -6,5 +6,6 @@
 pub mod direct_edge;
 pub mod null;
 
-#[cfg(feature = "tokio-std")]
+//#[cfg(any(feature = "tokio-std", feature = "embassy-net-v0_7"))]
+#[cfg(any(feature = "tokio-std"))]
 pub mod direct_router;
