@@ -3,7 +3,7 @@
 //! std udp uses COBS for framing over a UDP stream.
 
 use crate::interface_manager::{
-    utils::{cobs_stream, std::StdQueue},
+    utils::{framed_stream, std::StdQueue},
     Interface,
 };
 
@@ -11,5 +11,5 @@ use crate::interface_manager::{
 pub struct TokioUdpInterface {}
 
 impl Interface for TokioUdpInterface {
-    type Sink = cobs_stream::Sink<StdQueue>;
+    type Sink = framed_stream::Sink<StdQueue>;
 }
