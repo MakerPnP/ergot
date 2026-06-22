@@ -16,7 +16,6 @@ mod common;
 
 use std::time::Duration;
 
-use bbqueue::traits::bbqhdl::BbqHandle;
 use common::{make_edge_stack, ping_with_retry, spawn_ping_server, wait_active};
 use ergot::{
     Address,
@@ -27,22 +26,14 @@ use ergot::{
             direct_edge::EdgeFrameProcessor,
             router::{Router, UPSTREAM_IDENT},
         },
-        transports::tokio_cobs_stream::{self, CobsStreamRxWorker, CobsStreamTxWorker},
+        transports::tokio_cobs_stream,
         utils::{cobs_stream, std::new_std_queue},
     },
     net_stack::{ArcNetStack, services::bridge_seed_assign},
     well_known::ErgotPingEndpoint,
 };
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    select,
-    time::{sleep, timeout},
-};
-
-// Note: this test still manually constructs CobsStreamRxWorker/TxWorker for the
-// bridge *downstream pending* case (RouterFrameProcessor::new(0) before seed assign).
-// The bridge *upstream* uses tokio_cobs_stream::register_bridge_upstream.
+use tokio::time::{sleep, timeout};
 
 type RootStack =
     ArcNetStack<CriticalSectionRawMutex, Router<TokioStreamInterface, rand::rngs::StdRng, 64, 64>>;
@@ -137,60 +128,20 @@ async fn bridge_seed_routing_e2e_ping() {
     .await
     .unwrap();
 
-    // Register bridge downstream[0] → edge1
-    // Use register_interface_pending (no auto-assigned net_id) to avoid
-    // collision with upstream's net_id.
-    let bridge_d0_queue = new_std_queue(4096);
-    let bridge_d0_ident = bridge_stack
-        .manage_profile(|im| {
-            im.register_interface_pending(cobs_stream::Sink::new_from_handle(
-                bridge_d0_queue.clone(),
-                512,
-            ))
-        })
-        .unwrap();
-
-    // Spawn transport workers for bridge downstream[0]
-    {
-        let closer = std::sync::Arc::new(maitake_sync::WaitQueue::new());
-        bridge_stack.manage_profile(|im| {
-            im.set_interface_closer(bridge_d0_ident, closer.clone());
-        });
-
-        let stack_clone = bridge_stack.clone();
-        let mut rx_worker = CobsStreamRxWorker {
-            nsh: bridge_stack.clone(),
-            reader: Box::new(bridge_d0_read) as Box<dyn AsyncRead + Unpin + Send>,
-            closer: closer.clone(),
-            processor: ergot::interface_manager::profiles::router::RouterFrameProcessor::new(0), // placeholder, will be updated
-            ident: bridge_d0_ident,
-            liveness: None,
-            state_notify: None,
-            cobs_buf_size: 1024 * 1024,
-        };
-
-        tokio::task::spawn(async move {
-            let close = rx_worker.closer.clone();
-            select! {
-                _run = rx_worker.run() => { close.close(); },
-                _clf = close.wait() => {},
-            }
-            stack_clone.manage_profile(|im| {
-                let _ = im.deregister_interface(bridge_d0_ident);
-            });
-        });
-        tokio::task::spawn(
-            CobsStreamTxWorker {
-                writer: Box::new(bridge_d0_write) as Box<dyn AsyncWrite + Unpin + Send>,
-                consumer:
-                    <ergot::interface_manager::utils::std::StdQueue as BbqHandle>::stream_consumer(
-                        &bridge_d0_queue,
-                    ),
-                closer: closer.clone(),
-            }
-            .run(),
-        );
-    }
+    // Register bridge downstream[0] → edge1 as pending (no auto-assigned
+    // net_id) to avoid collision with upstream's net_id; the seed assignment
+    // below gives it a real one.
+    let bridge_d0_ident = tokio_cobs_stream::register_bridge_downstream(
+        bridge_stack.clone(),
+        bridge_d0_read,
+        bridge_d0_write,
+        512,
+        4096,
+        None,
+        None,
+    )
+    .await
+    .expect("bridge downstream registration");
 
     // Register edge1 as target of bridge
     tokio_cobs_stream::register_edge::<_, TokioStreamInterface, _, _>(
