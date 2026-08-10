@@ -19,11 +19,30 @@ use std::sync::{Arc, Mutex};
 struct RecordingSink {
     log: Arc<Mutex<Vec<String>>>,
     label: &'static str,
+    fail: bool,
 }
 
 impl RecordingSink {
     fn new(label: &'static str, log: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { log, label }
+        Self {
+            log,
+            label,
+            fail: false,
+        }
+    }
+
+    /// A sink whose queue is permanently "full": every send is recorded and
+    /// then refused, which `EdgePort` surfaces as `InterfaceFull`.
+    fn new_failing(label: &'static str, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            log,
+            label,
+            fail: true,
+        }
+    }
+
+    fn result(&self) -> Result<(), ()> {
+        if self.fail { Err(()) } else { Ok(()) }
     }
 }
 
@@ -36,21 +55,21 @@ impl InterfaceSink for RecordingSink {
             .lock()
             .unwrap()
             .push(format!("{}:send_ty:{}", self.label, hdr.dst));
-        Ok(())
+        self.result()
     }
     fn send_raw(&mut self, hdr: &HeaderSeq, _body: &[u8]) -> Result<(), ()> {
         self.log
             .lock()
             .unwrap()
             .push(format!("{}:send_raw:{}", self.label, hdr.dst));
-        Ok(())
+        self.result()
     }
     fn send_err(&mut self, hdr: &HeaderSeq, _err: ProtocolError) -> Result<(), ()> {
         self.log
             .lock()
             .unwrap()
             .push(format!("{}:send_err:{}", self.label, hdr.dst));
-        Ok(())
+        self.result()
     }
 }
 
@@ -66,6 +85,12 @@ fn make_bridge(log: &Arc<Mutex<Vec<String>>>) -> TestRouter {
         rand::rngs::StdRng::from_seed([0u8; 32]),
         RecordingSink::new("upstream", log.clone()),
     )
+}
+
+fn register_downstream(router: &mut TestRouter, sink: RecordingSink, net_id: u16) -> u8 {
+    let ident = router.register_interface_pending(sink).unwrap();
+    router.reassign_interface_net_id(ident, net_id).unwrap();
+    ident
 }
 
 fn make_hdr(src_net: u16, dst_net: u16, dst_node: u8, dst_port: u8) -> Header {
@@ -180,9 +205,7 @@ fn bridge_routes_known_downstream() {
         .unwrap();
 
     // Register downstream with net_id=1
-    router
-        .register_interface(RecordingSink::new("down0", log.clone()))
-        .unwrap();
+    register_downstream(&mut router, RecordingSink::new("down0", log.clone()), 1);
 
     // Send to net_id=1, node=2 — should go to downstream, NOT upstream
     let hdr = make_hdr(0, 1, 2, 5);
@@ -214,9 +237,7 @@ fn bridge_forwards_unknown_to_upstream() {
         .unwrap();
 
     // Register downstream
-    router
-        .register_interface(RecordingSink::new("down0", log.clone()))
-        .unwrap();
+    register_downstream(&mut router, RecordingSink::new("down0", log.clone()), 1);
 
     // Send to net_id=99 — unknown downstream, should go upstream
     let hdr = make_hdr(0, 99, 2, 5);
@@ -263,12 +284,8 @@ fn bridge_broadcast_includes_upstream() {
         )
         .unwrap();
 
-    router
-        .register_interface(RecordingSink::new("down0", log.clone()))
-        .unwrap();
-    router
-        .register_interface(RecordingSink::new("down1", log.clone()))
-        .unwrap();
+    register_downstream(&mut router, RecordingSink::new("down0", log.clone()), 1);
+    register_downstream(&mut router, RecordingSink::new("down1", log.clone()), 2);
 
     let hdr = make_broadcast_hdr();
     router.send(&hdr, &42u32).unwrap();
@@ -301,12 +318,8 @@ fn bridge_broadcast_from_upstream_skips_upstream() {
         )
         .unwrap();
 
-    router
-        .register_interface(RecordingSink::new("down0", log.clone()))
-        .unwrap();
-    router
-        .register_interface(RecordingSink::new("down1", log.clone()))
-        .unwrap();
+    register_downstream(&mut router, RecordingSink::new("down0", log.clone()), 1);
+    register_downstream(&mut router, RecordingSink::new("down1", log.clone()), 2);
 
     // Raw broadcast from upstream (source=UPSTREAM_IDENT)
     let hdr = HeaderSeq {
@@ -400,13 +413,9 @@ fn bridge_downstream_to_downstream_no_upstream() {
         )
         .unwrap();
 
-    let id0 = router
-        .register_interface(RecordingSink::new("down0", log.clone()))
-        .unwrap();
+    let id0 = register_downstream(&mut router, RecordingSink::new("down0", log.clone()), 1);
     // net_id=2
-    router
-        .register_interface(RecordingSink::new("down1", log.clone()))
-        .unwrap();
+    register_downstream(&mut router, RecordingSink::new("down1", log.clone()), 2);
 
     // Raw packet from down0 destined to net_id=2 (down1)
     let hdr = HeaderSeq {
@@ -454,9 +463,7 @@ fn bridge_send_err_forwards_upstream() {
         )
         .unwrap();
 
-    router
-        .register_interface(RecordingSink::new("down0", log.clone()))
-        .unwrap();
+    register_downstream(&mut router, RecordingSink::new("down0", log.clone()), 1);
 
     // Error to unknown net_id — should go upstream
     let hdr = Header {
@@ -483,4 +490,89 @@ fn bridge_send_err_forwards_upstream() {
     let entries = log.lock().unwrap();
     assert_eq!(entries.len(), 1);
     assert!(entries[0].starts_with("upstream:"));
+}
+
+// --- Broadcast: genuine failures vs no audience ---
+//
+// Conformance ("Broadcast Messages"): a broadcast reaching nobody is the
+// benign NoRouteToDest/RoutingLoop class (the net stack maps it to a
+// successful no-op), but a genuine delivery failure to an interface that
+// exists and was attempted (full queue) must surface as that failure.
+
+#[test]
+fn broadcast_full_everywhere_reports_genuine_failure() {
+    // Down upstream (benign: no recipient) + one Active downstream whose
+    // queue is "full": nobody got the message AND an existing interface
+    // genuinely failed — the failure must win over the benign default.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut router = make_bridge(&log);
+    register_downstream(
+        &mut router,
+        RecordingSink::new_failing("down0", log.clone()),
+        1,
+    );
+
+    let res = router.send(&make_broadcast_hdr(), &1234u64);
+    assert_eq!(res, Err(InterfaceSendError::InterfaceFull));
+}
+
+#[test]
+fn broadcast_partial_success_is_ok() {
+    // One full interface + one healthy one: reaching at least one recipient
+    // is success.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut router = make_bridge(&log);
+    register_downstream(
+        &mut router,
+        RecordingSink::new_failing("down0", log.clone()),
+        1,
+    );
+    register_downstream(&mut router, RecordingSink::new("down1", log.clone()), 2);
+
+    router.send(&make_broadcast_hdr(), &1234u64).unwrap();
+}
+
+#[test]
+fn broadcast_no_interfaces_is_benign_no_route() {
+    // Root router with no interfaces at all: nobody to deliver to — the
+    // benign class, NOT a genuine failure.
+    let mut router: TestRouter = Router::new(rand::rngs::StdRng::from_seed([0u8; 32]));
+    let res = router.send(&make_broadcast_hdr(), &1234u64);
+    assert_eq!(res, Err(InterfaceSendError::NoRouteToDest));
+}
+
+#[test]
+fn broadcast_raw_full_everywhere_reports_genuine_failure() {
+    // Same rule on the forwarded-broadcast (send_raw) leg: a broadcast from
+    // upstream that fails on every downstream queue reports the failure.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut router = make_bridge(&log);
+    register_downstream(
+        &mut router,
+        RecordingSink::new_failing("down0", log.clone()),
+        1,
+    );
+
+    let hdr = HeaderSeq {
+        src: Address {
+            network_id: 10,
+            node_id: 1,
+            port_id: 0,
+        },
+        dst: Address {
+            network_id: 0,
+            node_id: 0,
+            port_id: 255,
+        },
+        any_all: Some(AnyAllAppendix {
+            key: Key(*b"TESTTEST"),
+            nash: None,
+        }),
+        seq_no: 0,
+        kind: FrameKind::TOPIC_MSG,
+        ttl: 16,
+    };
+
+    let res = router.send_raw(&hdr, &[1, 2, 3], UPSTREAM_IDENT);
+    assert_eq!(res, Err(InterfaceSendError::InterfaceFull));
 }

@@ -128,7 +128,10 @@ fn unclaimed_node_frame_is_dropped_then_routed_after_claim() {
         1,
         "after claiming, the frame from node_id=50 should be forwarded"
     );
-    assert_eq!(captured[0].1.network_id, 2, "forwarded to the net_id=2 downstream");
+    assert_eq!(
+        captured[0].1.network_id, 2,
+        "forwarded to the net_id=2 downstream"
+    );
 }
 
 #[test]
@@ -209,5 +212,149 @@ fn claims_are_purged_when_interface_deregistered() {
     assert!(
         !stack.manage_profile(|im| im.is_node_claimed(bus_net, 50)),
         "claim must be purged when its interface is deregistered"
+    );
+}
+
+/// A node-claim refresh whose response is lost must be recoverable: the device
+/// retries with the only token it has (the previous one), and the router must
+/// accept that as an idempotent replay rather than rejecting it — otherwise the
+/// device can never refresh, its lease expires, and it is locked off the bus.
+#[test]
+fn node_claim_refresh_survives_a_lost_response() {
+    let stack: TestStack =
+        TestStack::new_with_profile(Router::new(rand::rngs::StdRng::from_seed([2u8; 32])));
+
+    let bus_ident = stack
+        .manage_profile(|im| {
+            im.register_interface(CaptureSink {
+                frames: Arc::new(Mutex::new(Vec::new())),
+            })
+        })
+        .unwrap();
+    let bus_net = stack.manage_profile(|im| im.net_id_of(bus_ident)).unwrap();
+
+    // Device claims node_id 50 and gets its first refresh token.
+    let claim = stack
+        .manage_profile(|im| im.request_node_claim(bus_net, 50, 0xAAAA))
+        .unwrap();
+    let token = claim.refresh_token;
+
+    // Device refreshes: the router rotates the token and replies — but the reply
+    // is LOST, so the device never learns the new token.
+    stack
+        .manage_profile(|im| im.refresh_node_claim(bus_net, 50, token))
+        .expect("first refresh should succeed");
+
+    // Device retries with the only token it still has.
+    let retry = stack.manage_profile(|im| im.refresh_node_claim(bus_net, 50, token));
+    assert!(
+        retry.is_ok(),
+        "a refresh retry with the previous token must be accepted as a replay, got {:?}",
+        retry.err()
+    );
+    assert!(
+        stack.manage_profile(|im| im.is_node_claimed(bus_net, 50)),
+        "the claim must remain active after a recovered refresh"
+    );
+}
+
+/// A replayed (idempotent) refresh does not extend the lease, so it must report
+/// the lease's actual remaining time — not a fresh full lease — or the client
+/// would schedule its next refresh too late and let the claim expire.
+#[test]
+fn node_claim_replay_reports_remaining_lease() {
+    let stack: TestStack =
+        TestStack::new_with_profile(Router::new(rand::rngs::StdRng::from_seed([5u8; 32])));
+
+    let bus_ident = stack
+        .manage_profile(|im| {
+            im.register_interface(CaptureSink {
+                frames: Arc::new(Mutex::new(Vec::new())),
+            })
+        })
+        .unwrap();
+    let bus_net = stack.manage_profile(|im| im.net_id_of(bus_ident)).unwrap();
+
+    let claim = stack
+        .manage_profile(|im| im.request_node_claim(bus_net, 50, 0xAAAA))
+        .unwrap();
+    let token = claim.refresh_token;
+
+    // A real refresh extends the lease and rotates the token; its reply is "lost".
+    let refreshed = stack
+        .manage_profile(|im| im.refresh_node_claim(bus_net, 50, token))
+        .expect("first refresh should succeed");
+    let max_lease = refreshed.expires_seconds; // the full lease length (MAX_LEASE_SECS)
+
+    // Let time pass, then retry with the previous token (a replay).
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let replay = stack
+        .manage_profile(|im| im.refresh_node_claim(bus_net, 50, token))
+        .expect("replay should be accepted");
+
+    assert!(
+        replay.expires_seconds < max_lease,
+        "a replay must report the reduced remaining lease ({} elapsed since the \
+         extend), not the full {}",
+        max_lease - replay.expires_seconds,
+        max_lease
+    );
+}
+
+/// Reassigning an interface's net_id must purge node claims scoped to the old
+/// net_id, so they don't linger and validate foreign frames (or block re-claims)
+/// if that net_id is later reused by another interface.
+#[test]
+fn node_claims_are_purged_on_net_id_reassignment() {
+    let stack: TestStack =
+        TestStack::new_with_profile(Router::new(rand::rngs::StdRng::from_seed([3u8; 32])));
+
+    let ident = stack
+        .manage_profile(|im| {
+            im.register_interface(CaptureSink {
+                frames: Arc::new(Mutex::new(Vec::new())),
+            })
+        })
+        .unwrap();
+    let old_net = stack.manage_profile(|im| im.net_id_of(ident)).unwrap();
+
+    stack
+        .manage_profile(|im| im.request_node_claim(old_net, 50, 0xBBBB))
+        .unwrap();
+    assert!(stack.manage_profile(|im| im.is_node_claimed(old_net, 50)));
+
+    // Reassign the interface to a different, unused net_id.
+    let new_net = old_net + 100;
+    stack
+        .manage_profile(|im| im.reassign_interface_net_id(ident, new_net))
+        .unwrap();
+
+    assert!(
+        !stack.manage_profile(|im| im.is_node_claimed(old_net, 50)),
+        "the old net_id's claim must be purged after reassignment"
+    );
+}
+
+/// A claim request with source net_id 0 must be rejected. net_id 0 is the pending
+/// placeholder; a request arriving on a not-yet-assigned slot must not be able to
+/// match that pending slot and be granted a claim scoped to net 0.
+#[test]
+fn node_claim_with_source_net_zero_is_rejected() {
+    let stack: TestStack =
+        TestStack::new_with_profile(Router::new(rand::rngs::StdRng::from_seed([4u8; 32])));
+
+    // A pending interface has net_id 0.
+    stack
+        .manage_profile(|im| {
+            im.register_interface_pending(CaptureSink {
+                frames: Arc::new(Mutex::new(Vec::new())),
+            })
+        })
+        .unwrap();
+
+    let res = stack.manage_profile(|im| im.request_node_claim(0, 50, 0xCCCC));
+    assert!(
+        res.is_err(),
+        "a claim scoped to net 0 (the pending placeholder) must be rejected, got {res:?}"
     );
 }

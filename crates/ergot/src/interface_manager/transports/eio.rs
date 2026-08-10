@@ -3,9 +3,39 @@
 //! Generic over any [`FrameProcessor`], so it works with [`DirectEdge`],
 //! [`Router`], or any future profile.
 //!
+//! # Bridging: the upstream link of an embedded bridge
+//!
+//! There is no `no_std` `register_*` helper equivalent to the `tokio`
+//! [`register_bridge_upstream`]: an embassy executor owns its tasks and
+//! `&'static` buffers, so the caller wires the worker up itself. The canonical
+//! shape mirrors that helper. Register the upstream under the reserved
+//! [`UPSTREAM_IDENT`], drive an [`EdgeFrameProcessor`] (which discovers the
+//! upstream net_id from inbound frames), and start the loop in the link-local
+//! boot state [`InterfaceState::edge_link_local()`] so the bridge can initiate
+//! contact before the root has addressed it. Read errors are recoverable — see
+//! [`RxWorker::run`] for the retry contract — so run it in a restart loop and
+//! spawn a matching transmit worker for the same link:
+//!
+//! ```ignore
+//! let mut rx = RxWorker::new(stack, uart_rx, EdgeFrameProcessor::new(), UPSTREAM_IDENT);
+//! loop {
+//!     let res = rx.run(InterfaceState::edge_link_local(), &mut frame, &mut scratch).await;
+//!     warn!("upstream rx exited: {:?}, restarting", res);
+//!     Timer::after_millis(100).await;
+//! }
+//! ```
+//!
+//! Downstream segments of the bridge are registered pending (they get a
+//! net_id from a seed router); see
+//! [`register_interface_pending`](crate::interface_manager::profiles::router::Router::register_interface_pending).
+//!
 //! [`FrameProcessor`]: crate::interface_manager::FrameProcessor
 //! [`DirectEdge`]: crate::interface_manager::profiles::direct_edge::DirectEdge
 //! [`Router`]: crate::interface_manager::profiles::router::Router
+//! [`register_bridge_upstream`]: crate::interface_manager::transports::tokio_cobs_stream::register_bridge_upstream
+//! [`UPSTREAM_IDENT`]: crate::interface_manager::profiles::router::UPSTREAM_IDENT
+//! [`EdgeFrameProcessor`]: crate::interface_manager::profiles::direct_edge::EdgeFrameProcessor
+//! [`InterfaceState::edge_link_local()`]: crate::interface_manager::InterfaceState::edge_link_local
 
 use cobs_acc::{CobsAccumulator, FeedResult};
 
@@ -45,6 +75,8 @@ where
     have_received: bool,
     #[cfg(feature = "embassy-time")]
     needs_cobs_reset: bool,
+    #[cfg(feature = "embassy-time")]
+    link_local_on_timeout: bool,
 }
 
 impl<N, R, P> RxWorker<N, R, P>
@@ -76,6 +108,8 @@ where
             have_received: false,
             #[cfg(feature = "embassy-time")]
             needs_cobs_reset: false,
+            #[cfg(feature = "embassy-time")]
+            link_local_on_timeout: false,
         }
     }
 
@@ -99,6 +133,27 @@ where
         self
     }
 
+    /// On a liveness timeout, revert the interface to the link-local edge boot
+    /// state ([`InterfaceState::edge_link_local`]) instead of
+    /// [`InterfaceState::Inactive`].
+    ///
+    /// Use this for an edge or bridge upstream. `Inactive` gates transmit until
+    /// frames resume, which is correct for a downstream peer but wrong for an
+    /// upstream: a quiet upstream still needs to send (e.g. a link-local ping)
+    /// to provoke the frame that re-discovers its net_id. Reverting to
+    /// link-local keeps transmit ungated so recovery can proceed; the processor
+    /// is reset either way, so the next inbound frame re-discovers the net_id.
+    ///
+    /// Trade-off: with this policy the interface state alone no longer
+    /// distinguishes "link dead" from "alive but not yet (re)discovered" —
+    /// both read as `Active { net_id: 0 }`. Liveness diagnostics move to logs
+    /// or counters.
+    #[cfg(feature = "embassy-time")]
+    pub fn revert_to_link_local_on_timeout(mut self) -> Self {
+        self.link_local_on_timeout = true;
+        self
+    }
+
     /// Notify the state observer, if configured.
     #[cfg(feature = "embassy-time")]
     fn notify(&self) {
@@ -112,6 +167,32 @@ where
     /// Sets `initial_state` on the interface before entering the frame
     /// loop. On exit (transport error or drop), the interface is set to
     /// [`InterfaceState::Down`].
+    ///
+    /// # Return value and retry contract
+    ///
+    /// This future resolves only when the underlying [`Read`] returns an
+    /// error; a successful `Ok(())` means end-of-stream (a zero-length read).
+    /// Frame decode errors, liveness timeouts, and per-frame processing are
+    /// all handled internally and never end the loop.
+    ///
+    /// Whether the returned error is fatal or recoverable is the transport's
+    /// concern, and deciding what to do about it is the **caller's**
+    /// responsibility. On many embedded links a read error is routine (framing
+    /// or overrun glitches, a cable disturbed near a motor drive) and the right
+    /// response is to log it and re-enter the loop after a short delay. The
+    /// buffers can be reused across runs:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let res = rx_worker.run(initial_state, &mut frame, &mut scratch).await;
+    ///     warn!("rx worker exited: {:?}, restarting", res);
+    ///     Timer::after_millis(100).await;
+    /// }
+    /// ```
+    ///
+    /// A caller that instead treats the link as gone can simply return and
+    /// leave the interface [`Down`](InterfaceState::Down), which is where
+    /// `run` leaves it on exit.
     pub async fn run(
         &mut self,
         initial_state: InterfaceState,
@@ -142,6 +223,14 @@ where
 
         'outer: loop {
             let used = self.read_or_timeout(scratch).await?;
+
+            // A zero-length read into a non-empty buffer means end-of-stream.
+            // Return so the caller marks the interface Down, instead of hot-looping
+            // on repeated empty reads (matches the futures-io transport's EOF
+            // handling).
+            if used == 0 {
+                return Ok(());
+            }
 
             // After liveness timeout, flush stale COBS state
             #[cfg(feature = "embassy-time")]
@@ -199,15 +288,17 @@ where
                     match embassy_time::with_timeout(duration, self.rx.read(scratch)).await {
                         Ok(result) => return result,
                         Err(_timeout) => {
+                            let target = if self.link_local_on_timeout {
+                                InterfaceState::edge_link_local()
+                            } else {
+                                InterfaceState::Inactive
+                            };
                             let changed = self.nsh.stack().manage_profile(|im| {
-                                if matches!(
-                                    im.interface_state(self.ident.clone()),
-                                    Some(InterfaceState::Active { .. })
-                                ) {
-                                    _ = im.set_interface_state(
-                                        self.ident.clone(),
-                                        InterfaceState::Inactive,
-                                    );
+                                let current = im.interface_state(self.ident.clone());
+                                if matches!(current, Some(InterfaceState::Active { .. }))
+                                    && current != Some(target)
+                                {
+                                    _ = im.set_interface_state(self.ident.clone(), target);
                                     true
                                 } else {
                                     false

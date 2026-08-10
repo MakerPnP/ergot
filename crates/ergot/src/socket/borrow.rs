@@ -13,12 +13,11 @@
 //! able to fully skip a ser/de round trip when sending messages locally.
 
 use core::{
-    any::TypeId,
     cell::UnsafeCell,
     marker::PhantomData,
     ops::Deref,
     pin::Pin,
-    ptr::{NonNull, addr_of},
+    ptr::{NonNull, addr_of, addr_of_mut},
     task::{Context, Poll, Waker},
 };
 
@@ -78,9 +77,14 @@ where
     hdl: &'a mut SocketHdl<'b, Q, T, N>,
 }
 
-pub struct ResponseGrant<Q: BbqHandle, T> {
+pub struct ResponseGrant<'a, Q: BbqHandle, T> {
     pub hdr: HeaderSeq,
     inner: ResponseGrantInner<Q, T>,
+    // Ties the grant to the `&mut` borrow taken by `recv()`: a borrow socket holds
+    // at most one read grant, so while this grant is alive the socket handle stays
+    // mutably borrowed and cannot be `recv()`d again. Invariant in `'a` (as `&mut`
+    // is), which is what we want.
+    _brw: PhantomData<&'a mut ()>,
 }
 
 struct QueueBox<Q: BbqHandle> {
@@ -164,7 +168,12 @@ where
 
     const fn vtable() -> SocketVTable {
         SocketVTable {
-            recv_owned: Some(Self::recv_owned),
+            // Borrow sockets deliberately do NOT provide `recv_owned`: it would have
+            // to reinterpret the sender's value as this socket's message type with no
+            // `TypeId` check (borrowed types pun across lifetimes, so a check is not
+            // possible), which is unsound for a mismatched sender. Owned sends to a
+            // borrow socket are instead serialized at the sender's type via `recv_bor`.
+            recv_owned: None,
             recv_bor: Some(Self::recv_bor),
             recv_raw: Self::recv_raw,
             recv_err: Some(Self::recv_err),
@@ -197,41 +206,6 @@ where
                 wake.wake();
             }
         }
-    }
-
-    fn recv_owned(
-        this: NonNull<()>,
-        that: NonNull<()>,
-        hdr: HeaderSeq,
-        // We can't use TypeId here because mismatched lifetimes have different
-        // type ids!
-        _ty: &TypeId,
-    ) -> Result<(), SocketSendError> {
-        let that: NonNull<T> = that.cast();
-        let that: &T = unsafe { that.as_ref() };
-        let this: NonNull<Self> = this.cast();
-        let this: &Self = unsafe { this.as_ref() };
-        let qbox: &mut QueueBox<Q> = unsafe { &mut *this.inner.get() };
-        let qref = qbox.q.bbq_ref();
-        let prod = qref.framed_producer();
-
-        let Ok(mut wgr) = prod.grant(this.mtu) else {
-            return Err(SocketSendError::NoSpace);
-        };
-        let ser = ser_flavors::Slice::new(&mut wgr);
-
-        let Ok(used) = wire_frames::encode_frame_ty(ser, &hdr, that) else {
-            return Err(SocketSendError::NoSpace);
-        };
-
-        let len = used.len() as u16;
-        wgr.commit(len);
-
-        if let Some(wake) = qbox.waker.take() {
-            wake.wake();
-        }
-
-        Ok(())
     }
 
     fn recv_bor(
@@ -319,6 +293,14 @@ where
         unsafe { (*addr_of!((*self.ptr.as_ptr()).net)).clone() }
     }
 
+    /// Await the next frame, returning a [`ResponseGrant`] that borrows the
+    /// socket's queue.
+    ///
+    /// The returned [`ResponseGrant`] MUST be dropped before calling `recv()`
+    /// again on this socket. A borrow socket holds at most one outstanding read
+    /// grant, so a `recv()` issued while a previous `ResponseGrant` is still alive
+    /// cannot make progress and will block indefinitely — access the grant (e.g.
+    /// via [`ResponseGrant::try_access`]) and drop it, then `recv()` again.
     pub fn recv<'b>(&'b mut self) -> Recv<'b, 'a, Q, T, N> {
         Recv { hdl: self }
     }
@@ -338,19 +320,49 @@ where
     }
 }
 
-unsafe impl<Q, T, N> Send for SocketHdl<'_, Q, T, N>
+impl<Q, T, N> Drop for SocketHdl<'_, Q, T, N>
 where
     Q: BbqHandle,
     T: Serialize,
     N: NetStackHandle,
 {
+    fn drop(&mut self) {
+        // Detaching on handle drop is the fast path: it unlinks the socket as soon
+        // as the handle goes away, so the same pinned socket can be re-`attach`ed.
+        // `Socket::drop` is a backstop for a leaked handle; `detach_socket` is
+        // idempotent, so running both in the normal case is safe.
+        //
+        // SAFETY: the handle borrows the socket for `'a`, so `self.ptr` is valid
+        // here, and `detach_socket` takes the netstack lock internally.
+        unsafe {
+            let net = self.stack();
+            let hdr_ptr: *mut SocketHeader = addr_of_mut!((*self.ptr.as_ptr()).hdr);
+            net.detach_socket(NonNull::new_unchecked(hdr_ptr));
+        }
+    }
+}
+
+// Bounds are load-bearing. `N::Target: Send + Sync`: the handle can clone
+// `N::Target` through the socket pointer, so a non-thread-safe target (e.g.
+// `Rc<NetStack>`, or a `NetStack` behind a non-`Sync` `ScopedRawMutex`) must not
+// become usable from two threads. `Q: Send`: `recv()` accesses and clones the
+// queue handle on whatever thread the handle is moved to, so an `Rc`-backed
+// `BbqHandle` (which safe downstream code may define) must not make this `Send`.
+unsafe impl<Q, T, N> Send for SocketHdl<'_, Q, T, N>
+where
+    Q: BbqHandle + Send,
+    T: Serialize,
+    N: NetStackHandle,
+    N::Target: Send + Sync,
+{
 }
 
 unsafe impl<Q, T, N> Sync for SocketHdl<'_, Q, T, N>
 where
-    Q: BbqHandle,
+    Q: BbqHandle + Send,
     T: Serialize,
     N: NetStackHandle,
+    N::Target: Send + Sync,
 {
 }
 
@@ -362,15 +374,22 @@ where
     T: Serialize,
     N: NetStackHandle,
 {
-    type Output = ResponseGrant<Q, T>;
+    type Output = ResponseGrant<'a, Q, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let net: N::Target = self.hdl.stack();
-        let f = || -> Option<ResponseGrant<Q, T>> {
+        let f = || -> Option<ResponseGrant<'a, Q, T>> {
             let this_ref: &Socket<Q, T, N> = unsafe { self.hdl.ptr.as_ref() };
             let qbox: &mut QueueBox<Q> = unsafe { &mut *this_ref.inner.get() };
             let cons: FramedConsumer<Q, u16> = qbox.q.framed_consumer();
 
+            // An outstanding read grant (an unreleased `ResponseGrant` from a
+            // previous `recv()` on this socket) surfaces from `read()` as an `Err`,
+            // so it parks here exactly like an empty queue. A `ResponseGrant` MUST be
+            // dropped before the next `recv()` on the same socket — see `recv()` — so
+            // this parked state is not reached by correct code; when it is, it stays
+            // parked (the socket waker is woken only by a producer, never by a grant
+            // release) rather than busy-looping.
             if let Ok(resp) = cons.read() {
                 let sli: &[u8] = resp.deref();
 
@@ -404,6 +423,7 @@ where
                                     offset,
                                     deser_erased: PhantomData,
                                 },
+                                _brw: PhantomData,
                             });
                         }
                         Err(err) => {
@@ -411,6 +431,7 @@ where
                             return Some(ResponseGrant {
                                 hdr,
                                 inner: ResponseGrantInner::Err(err),
+                                _brw: PhantomData,
                             });
                         }
                     }
@@ -439,15 +460,16 @@ where
 
 unsafe impl<Q, T, N> Sync for Recv<'_, '_, Q, T, N>
 where
-    Q: BbqHandle,
+    Q: BbqHandle + Send,
     T: Serialize,
     N: NetStackHandle,
+    N::Target: Send + Sync,
 {
 }
 
 // impl ResponseGrant
 
-impl<Q: BbqHandle, T> ResponseGrant<Q, T> {
+impl<Q: BbqHandle, T> ResponseGrant<'_, Q, T> {
     // TODO: I don't want this being failable, but right now I can't figure out
     // how to make Recv::poll() do the checking without hitting awkward inner
     // lifetimes for deserialization. If you know how to make this less awkward,
@@ -477,7 +499,7 @@ impl<Q: BbqHandle, T> ResponseGrant<Q, T> {
     }
 }
 
-impl<Q: BbqHandle, T> Drop for ResponseGrant<Q, T> {
+impl<Q: BbqHandle, T> Drop for ResponseGrant<'_, Q, T> {
     fn drop(&mut self) {
         let old = core::mem::replace(
             &mut self.inner,

@@ -271,7 +271,8 @@ where
         ty: &TypeId,
     ) -> Result<(), SocketSendError> {
         if &TypeId::of::<T>() != ty {
-            debug_assert!(false, "Type Mismatch!");
+            // Reachable at runtime, e.g. a stale port reused for a different type
+            // after a peer restart — return the error rather than panicking.
             return Err(SocketSendError::TypeMismatch);
         }
         let that: NonNull<T> = that.cast();
@@ -351,6 +352,31 @@ where
     }
 }
 
+impl<S, T, N> Drop for Socket<S, T, N>
+where
+    S: Storage<Response<T>>,
+    T: Clone + DeserializeOwned + 'static,
+    N: NetStackHandle,
+{
+    fn drop(&mut self) {
+        // Backstop against a leaked handle: unlinking normally happens in
+        // `SocketHdl::drop`, but a `mem::forget`-ed handle (safe code) skips that,
+        // which would leave this socket's node dangling in the netstack list once
+        // its storage is freed — a use-after-free on the next send. Detach here so
+        // the object's own destruction always unlinks it. `detach_socket` is
+        // idempotent, so the normal path (handle detaches first, then — for boxed
+        // sockets — this runs during `Box::from_raw`) does not double-free the port.
+        //
+        // SAFETY: `&mut self` means the socket is still alive here; `detach_socket`
+        // takes the netstack lock internally.
+        unsafe {
+            let net = self.net.clone();
+            let hdr_ptr: *mut SocketHeader = self.hdr.get();
+            net.detach_socket(NonNull::new_unchecked(hdr_ptr));
+        }
+    }
+}
+
 impl<S, T, N> Drop for SocketHdl<'_, S, T, N>
 where
     S: Storage<Response<T>>,
@@ -377,21 +403,27 @@ where
     }
 }
 
+// `S: Send` and `N::Target: Send + Sync` are load-bearing: crossing threads with
+// the handle lets another thread operate the (public, `'static`-only) storage and
+// clone `N::Target` through the socket pointer, so a non-`Send` storage or a
+// non-thread-safe target (e.g. `Rc<NetStack>`) must not be `Send`/`Sync` here.
 unsafe impl<S, T, N> Send for SocketHdl<'_, S, T, N>
 where
-    S: Storage<Response<T>>,
+    S: Storage<Response<T>> + Send,
     T: Send,
     T: Clone + DeserializeOwned + 'static,
     N: NetStackHandle,
+    N::Target: Send + Sync,
 {
 }
 
 unsafe impl<S, T, N> Sync for SocketHdl<'_, S, T, N>
 where
-    S: Storage<Response<T>>,
+    S: Storage<Response<T>> + Send,
     T: Send,
     T: Clone + DeserializeOwned + 'static,
     N: NetStackHandle,
+    N::Target: Send + Sync,
 {
 }
 
@@ -437,10 +469,11 @@ where
 
 unsafe impl<S, T, N> Sync for Recv<'_, '_, S, T, N>
 where
-    S: Storage<Response<T>>,
+    S: Storage<Response<T>> + Send,
     T: Send,
     T: Clone + DeserializeOwned + 'static,
     N: NetStackHandle,
+    N::Target: Send + Sync,
 {
 }
 

@@ -53,10 +53,51 @@ fn device_match(d1: &nusb::DeviceInfo, d2: &nusb::DeviceInfo) -> bool {
 /// This function does not add new devices to `devs`, the caller will need to do that
 /// between calls to `find_new_devices`.
 pub async fn find_new_devices(devs: &HashSet<DeviceInfo>) -> Vec<NewDevice> {
+    find_new_devices_with_filter(devs, coarse_device_filter).await
+}
+
+/// A helper function for finding new devices not contained in the provided `devs` set without the default filter.
+/// The caller has to provide their own filter. If they want to expand on the default filtering they can use the
+/// existing [`coarse_device_filter`] in combination with their own filter
+///
+/// This function does not add new devices to `devs`, the caller will need to do that
+/// between calls to `find_new_devices_with_filter`.
+///
+/// # Examples
+/// Filtering only on the interface's product string
+/// ```no_run
+/// use std::collections::HashSet;
+/// use ergot::toolkits::nusb_v0_1::find_new_devices_with_filter;
+/// # async fn example() {
+/// let devices = HashSet::new();
+/// let new = find_new_devices_with_filter(&devices, |d| {
+///     d.product_string() == Some("my_custom_usb_interface")
+/// })
+/// .await;
+/// # }
+/// ```
+///
+/// Expanding on the existing filtering by using the default filtering method
+/// [`coarse_device_filter`] as well as checking the product string
+/// ```no_run
+/// use std::collections::HashSet;
+/// use ergot::toolkits::nusb_v0_1::{coarse_device_filter, find_new_devices_with_filter};
+/// # async fn example() {
+/// let devices = HashSet::new();
+/// let new = find_new_devices_with_filter(&devices, |d| {
+///     coarse_device_filter(d) || d.product_string() == Some("my_custom_usb_interface")
+/// })
+/// .await;
+/// # }
+/// ```
+pub async fn find_new_devices_with_filter<T: Fn(&nusb::DeviceInfo) -> bool>(
+    devs: &HashSet<DeviceInfo>,
+    filter: T,
+) -> Vec<NewDevice> {
     trace!("Searching for new devices...");
     let mut out = vec![];
     let devices = nusb::list_devices().unwrap();
-    let devices = devices.filter(coarse_device_filter).collect::<Vec<_>>();
+    let devices = devices.filter(filter).collect::<Vec<_>>();
 
     for device in devices {
         let dinfo = DeviceInfo {
@@ -162,7 +203,11 @@ pub async fn find_new_devices(devs: &HashSet<DeviceInfo>) -> Vec<NewDevice> {
     out
 }
 
-fn coarse_device_filter(info: &nusb::DeviceInfo) -> bool {
+/// The default filter function used in [`find_new_devices`]
+///
+/// Checks if any interface uses `0xFF` as class, `0xCA` as subclass and `0x7D` as protocol
+/// as well as if the interface string is `ergot`, all of which are set in the nusb examples
+pub fn coarse_device_filter(info: &nusb::DeviceInfo) -> bool {
     info.interfaces().any(|intfc| {
         let pre_check =
             intfc.class() == 0xFF && intfc.subclass() == 0xCA && intfc.protocol() == 0x7D;

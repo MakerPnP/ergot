@@ -249,10 +249,7 @@ pub mod tokio_tcp {
             tx,
             queue.clone(),
             EdgeFrameProcessor::new(),
-            InterfaceState::Active {
-                net_id: 0,
-                node_id: crate::interface_manager::edge_port::EDGE_NODE_ID,
-            },
+            InterfaceState::edge_link_local(),
             None,
             None,
         )
@@ -329,10 +326,7 @@ pub mod tokio_udp {
             socket,
             queue.clone(),
             EdgeFrameProcessor::new(),
-            InterfaceState::Active {
-                net_id: 0,
-                node_id: crate::interface_manager::edge_port::EDGE_NODE_ID,
-            },
+            InterfaceState::edge_link_local(),
             liveness,
             state_notify,
         )
@@ -416,10 +410,7 @@ pub mod tokio_stream {
             writer,
             queue,
             EdgeFrameProcessor::new(),
-            InterfaceState::Active {
-                net_id: 0,
-                node_id: crate::interface_manager::edge_port::EDGE_NODE_ID,
-            },
+            InterfaceState::edge_link_local(),
             liveness,
             state_notify,
         )
@@ -476,7 +467,9 @@ pub mod nusb_v0_1 {
 
     use crate::net_stack::ArcNetStack;
 
-    pub use crate::interface_manager::interface_impls::nusb_bulk::{NewDevice, find_new_devices};
+    pub use crate::interface_manager::interface_impls::nusb_bulk::{
+        NewDevice, coarse_device_filter, find_new_devices, find_new_devices_with_filter,
+    };
 
     pub type RouterStack =
         ArcNetStack<CriticalSectionRawMutex, Router<NusbBulk, rand::rngs::StdRng, 64, 64>>;
@@ -573,10 +566,7 @@ pub mod tokio_serial_v5 {
             baud,
             queue.clone(),
             crate::interface_manager::profiles::direct_edge::EdgeFrameProcessor::new(),
-            crate::interface_manager::InterfaceState::Active {
-                net_id: 0,
-                node_id: crate::interface_manager::edge_port::EDGE_NODE_ID,
-            },
+            crate::interface_manager::InterfaceState::edge_link_local(),
             liveness,
             state_notify,
         )

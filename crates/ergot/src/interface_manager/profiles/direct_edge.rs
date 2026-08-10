@@ -139,23 +139,58 @@ impl<I: Interface> Profile for DirectEdge<I> {
 
 /// Frame processor for `DirectEdge` profile.
 ///
-/// Discovers `net_id` from the first incoming frame and transitions the
-/// interface to [`InterfaceState::Active`]. Subsequent frames reuse the
-/// discovered net_id unless it changes (e.g., after reassignment).
+/// Discovers `net_id` from incoming frames and transitions the interface to
+/// [`InterfaceState::Active`]. Discovery only runs while the *window* is
+/// open — after construction or [`reset()`](crate::interface_manager::FrameProcessor::reset)
+/// (liveness timeout), including while a sticky ID is provisionally Active — and only from
+/// a frame that is plausibly addressed to this device: `dst.node_id` matches
+/// our role's node_id AND the profile does not already route
+/// `dst.network_id` somewhere else ([`Profile::is_transit_net`]).
+///
+/// The guard exists for the bridge-upstream use of this processor: transit
+/// frames pass through an upstream with the dst nets of *other* segments,
+/// and a blind first-frame latch after a liveness reset could adopt a
+/// downstream segment's net_id as the upstream's own — the bridge would then
+/// emit frames src-addressed as some other device until the next lucky
+/// re-discovery. A discovered net is therefore also kept across `reset()` as
+/// a sticky hint, so the first frame after a liveness timeout — transit or
+/// not — reactivates the interface with the known net, while a frame that
+/// passes the guard may still update it (e.g. the root renumbered the
+/// segment after a reboot).
 pub struct EdgeFrameProcessor {
     net_id: Option<u16>,
+    /// Our node_id on this link: [`EDGE_NODE_ID`] in target mode,
+    /// [`CENTRAL_NODE_ID`] in controller mode. Used both to filter which
+    /// frames may donate a net_id and as the node to (re)activate with.
+    own_node: u8,
+    /// Closed (`true`) once an Active interface has been observed or
+    /// produced; while closed, frames are processed with zero profile
+    /// queries. Cleared by `reset()`.
+    activated: bool,
+    /// `true` after a liveness reset with a sticky net_id. Transit traffic may
+    /// reactivate that ID, but the window stays open until an addressed frame
+    /// confirms or replaces it.
+    rediscovering: bool,
 }
 
 impl EdgeFrameProcessor {
     /// Create a new processor with no discovered net_id (target mode).
     pub fn new() -> Self {
-        Self { net_id: None }
+        Self {
+            net_id: None,
+            own_node: EDGE_NODE_ID,
+            activated: false,
+            rediscovering: false,
+        }
     }
 
     /// Create a new processor with a pre-set net_id (controller mode).
     pub fn new_controller(net_id: u16) -> Self {
         Self {
             net_id: Some(net_id),
+            own_node: CENTRAL_NODE_ID,
+            activated: false,
+            rediscovering: false,
         }
     }
 }
@@ -176,58 +211,107 @@ where
         nsh: &N,
         ident: <<N as crate::net_stack::NetStackHandle>::Profile as crate::interface_manager::Profile>::InterfaceIdent,
     ) -> bool {
-        let prev = self.net_id;
-        process_frame(&mut self.net_id, data, nsh, ident);
-        self.net_id != prev
+        process_frame(self, data, nsh, ident)
     }
 
     fn reset(&mut self) {
-        self.net_id = None;
+        // Keep net_id as a sticky hint: after a liveness timeout the next
+        // frame reactivates the interface with the known net even if it is
+        // transit, and only a frame passing the discovery guard may replace
+        // the net with a different one.
+        self.activated = false;
+        self.rediscovering = self.net_id.is_some();
     }
 }
 
-/// Process one rx worker frame for direct edge workers
+/// Process one rx worker frame for direct edge workers.
+///
+/// Returns `true` if the interface state changed (activation or a net_id
+/// update) — callers use this to notify state watchers.
 pub fn process_frame<N>(
-    net_id: &mut Option<u16>,
+    state: &mut EdgeFrameProcessor,
     data: &[u8],
     nsh: &N,
     ident: <<N as NetStackHandle>::Profile as Profile>::InterfaceIdent,
-) where
+) -> bool
+where
     N: NetStackHandle,
 {
     let Some(mut frame) = de_frame(data) else {
         warn!(
             "Decode error! Ignoring frame on net_id {}",
-            net_id.unwrap_or(0)
+            state.net_id.unwrap_or(0)
         );
-        return;
+        return false;
     };
 
     debug!("{}: Got Frame!", frame.hdr);
 
-    // Discover net_id from the first incoming frame only. Once discovered,
-    // don't update — on a bridge upstream, transit frames pass through with
-    // various dst.network_ids that don't reflect this interface's net_id.
-    // After a liveness timeout, reset() clears net_id to None, allowing
-    // re-discovery on the next frame.
-    let take_net = net_id.is_none() && frame.hdr.dst.network_id != 0;
+    let mut state_changed = false;
 
-    if take_net {
-        let ok = nsh.stack().manage_profile(|im| {
-            im.set_interface_state(
-                ident.clone(),
-                InterfaceState::Active {
-                    net_id: frame.hdr.dst.network_id,
-                    node_id: EDGE_NODE_ID,
-                },
-            )
-            .is_ok()
+    // Discovery / reactivation window: open after construction or reset()
+    // (liveness timeout). In steady state (`activated`) frames are processed
+    // with no profile queries at all.
+    if !state.activated {
+        let dst = frame.hdr.dst;
+        let can_donate = dst.network_id != 0 && dst.node_id == state.own_node;
+        let discovery = nsh.stack().manage_profile(|im| {
+            let if_state = im
+                .interface_state(ident.clone())
+                .ok_or("Frame for unknown interface")?;
+            match if_state {
+                // Already Active with a real net (pre-activated by
+                // registration code or reassigned by a seed router): adopt it
+                // and close a boot-time window.
+                InterfaceState::Active { net_id, .. } if net_id != 0 && !state.rediscovering => {
+                    state.net_id = Some(net_id);
+                    state.activated = true;
+                }
+                // Not fully confirmed: Inactive/Down, link-local net 0, or a
+                // sticky ID provisionally reactivated during rediscovery.
+                InterfaceState::Active { .. } | InterfaceState::Inactive | InterfaceState::Down => {
+                    // Only plausible donors pay the transit lookup cost.
+                    let donates = can_donate && !im.is_transit_net(dst.network_id);
+                    let new_net = if donates {
+                        Some(dst.network_id)
+                    } else {
+                        state.net_id
+                    };
+
+                    if let Some(net) = new_net {
+                        let already_active = matches!(
+                            if_state,
+                            InterfaceState::Active { net_id, node_id }
+                                if net_id == net && node_id == state.own_node
+                        );
+                        if !already_active {
+                            im.set_interface_state(
+                                ident.clone(),
+                                InterfaceState::Active {
+                                    net_id: net,
+                                    node_id: state.own_node,
+                                },
+                            )
+                            .map_err(|_| "Failed to set interface state from frame")?;
+                        }
+                        state.net_id = Some(net);
+                        if donates {
+                            state.activated = true;
+                            state.rediscovering = false;
+                        }
+                        state_changed |= !already_active;
+                    }
+                    // No net known and no donor: keep the window open and
+                    // process this frame with link-local addressing.
+                }
+                // Bus-style local-only state is managed by the claim protocol.
+                InterfaceState::ActiveLocal { .. } => state.activated = true,
+            }
+            Ok::<(), &'static str>(())
         });
-        if ok {
-            *net_id = Some(frame.hdr.dst.network_id);
-        } else {
-            warn!("Failed to set interface state from frame (wrong node_id?), dropping");
-            return;
+        if let Err(_message) = discovery {
+            warn!("{}, dropping", _message);
+            return state_changed;
         }
     }
 
@@ -236,19 +320,19 @@ pub fn process_frame<N>(
     // local packet.
     //
     // TODO: accept any packet if we don't have a net_id yet?
-    if let Some(net) = net_id.as_ref()
+    if let Some(net) = state.net_id.as_ref()
         && frame.hdr.src.network_id == 0
     {
         if frame.hdr.src.node_id == 0 {
             warn!("Dropping frame with src node_id 0 (stale or local packet received remotely)");
-            return;
+            return state_changed;
         }
-        if frame.hdr.src.node_id == EDGE_NODE_ID {
+        if frame.hdr.src.node_id == state.own_node {
             warn!(
                 "Dropping frame with src node_id {} (spoofed as us)",
-                EDGE_NODE_ID
+                state.own_node
             );
-            return;
+            return state_changed;
         }
 
         frame.hdr.src.network_id = *net;
@@ -276,4 +360,6 @@ pub fn process_frame<N>(
             warn!("send error: {:?}", e);
         }
     }
+
+    state_changed
 }

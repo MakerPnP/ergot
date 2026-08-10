@@ -11,10 +11,7 @@
 use std::sync::Arc;
 
 use crate::{
-    interface_manager::{
-        Interface, InterfaceState, LivenessConfig, Profile,
-        utils::std::StdQueue,
-    },
+    interface_manager::{Interface, InterfaceState, LivenessConfig, Profile, utils::std::StdQueue},
     logging::{error, info, warn},
     net_stack::NetStackHandle,
 };
@@ -215,7 +212,10 @@ where
     let closer = Arc::new(WaitQueue::new());
 
     let overhead = cobs::max_encoding_overhead(max_ergot_packet_size as usize);
-    let cobs_buf_size = max_ergot_packet_size as usize + overhead;
+    // `+ 1` for the COBS frame delimiter (0x00), which the accumulator holds in the
+    // buffer alongside the encoded frame; without it a worst-case frame that arrives
+    // split across two reads would overflow the accumulator.
+    let cobs_buf_size = max_ergot_packet_size as usize + overhead + 1;
 
     let nsh_clone = stack.clone();
 
@@ -275,7 +275,13 @@ pub struct BridgeUpstreamRegistrationError;
 /// addressing (`net_id = 0`), allowing the bridge to initiate contact
 /// before receiving any frame from the root router.
 ///
+/// If `liveness` is set, a timeout reverts the upstream to that link-local
+/// boot state rather than [`InterfaceState::Inactive`], so the bridge's
+/// transmit side stays ungated and can re-provoke net_id discovery (see
+/// [`RxWorker::revert_to_link_local_on_timeout`]).
+///
 /// [`Router`]: crate::interface_manager::profiles::router::Router
+/// [`RxWorker::revert_to_link_local_on_timeout`]: crate::interface_manager::transports::futures_io::RxWorker::revert_to_link_local_on_timeout
 #[allow(clippy::too_many_arguments)]
 pub async fn register_bridge_upstream<N, R, W>(
     stack: N,
@@ -296,13 +302,7 @@ where
     stack
         .stack()
         .manage_profile(|im| {
-            im.set_interface_state(
-                UPSTREAM_IDENT.into(),
-                InterfaceState::Active {
-                    net_id: 0,
-                    node_id: crate::interface_manager::edge_port::EDGE_NODE_ID,
-                },
-            )
+            im.set_interface_state(UPSTREAM_IDENT.into(), InterfaceState::edge_link_local())
         })
         .map_err(|_| BridgeUpstreamRegistrationError)?;
     if let Some(notify) = &state_notify {
@@ -315,7 +315,11 @@ where
         EdgeFrameProcessor::new(),
         UPSTREAM_IDENT.into(),
     )
-    .with_closer(closer.clone());
+    .with_closer(closer.clone())
+    // Upstream is an edge: on a liveness timeout, revert to link-local rather
+    // than Inactive so the bridge's transmit side stays ungated and can
+    // re-provoke net_id discovery.
+    .revert_to_link_local_on_timeout();
     if let Some(notify) = state_notify {
         rx_worker = rx_worker.with_state_notify(notify);
     }
@@ -397,7 +401,10 @@ where
     let closer = Arc::new(WaitQueue::new());
 
     let overhead = cobs::max_encoding_overhead(max_ergot_packet_size as usize);
-    let cobs_buf_size = max_ergot_packet_size as usize + overhead;
+    // `+ 1` for the COBS frame delimiter (0x00), which the accumulator holds in the
+    // buffer alongside the encoded frame; without it a worst-case frame that arrives
+    // split across two reads would overflow the accumulator.
+    let cobs_buf_size = max_ergot_packet_size as usize + overhead + 1;
 
     let nsh_clone = stack.clone();
 
