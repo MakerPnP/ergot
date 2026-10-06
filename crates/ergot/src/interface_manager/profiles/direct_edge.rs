@@ -25,7 +25,7 @@ pub type EmbassyUsbManager<Q> =
     DirectEdge<crate::interface_manager::interface_impls::embassy_usb::EmbassyInterface<Q>>;
 
 use crate::{
-    Header, HeaderSeq, ProtocolError,
+    Header, ProtocolError,
     interface_manager::{
         Interface, InterfaceSendError, InterfaceState, Profile, SetStateError, edge_port::EdgePort,
     },
@@ -33,7 +33,7 @@ use crate::{
     wire_frames::de_frame,
 };
 
-pub use crate::interface_manager::edge_port::{CENTRAL_NODE_ID, EDGE_NODE_ID};
+pub use crate::interface_manager::edge_port::{BROADCAST_NODE_ID, CENTRAL_NODE_ID, EDGE_NODE_ID};
 
 pub enum SetNetIdError {
     CantSetZero,
@@ -43,6 +43,8 @@ pub enum SetNetIdError {
 /// Edge device profile backed by a single `EdgePort`.
 pub struct DirectEdge<I: Interface> {
     port: EdgePort<I>,
+    /// Counts changes of the port's state; see [`Profile::state_generation`].
+    generation: u32,
     /// Closer for signaling workers to stop. Set by `register_*_stream`,
     /// closed when the interface transitions to `Down`.
     #[cfg(feature = "std")]
@@ -53,6 +55,7 @@ impl<I: Interface> DirectEdge<I> {
     pub const fn new_target(sink: I::Sink) -> Self {
         Self {
             port: EdgePort::new_target(sink),
+            generation: 0,
             #[cfg(feature = "std")]
             closer: None,
         }
@@ -61,9 +64,20 @@ impl<I: Interface> DirectEdge<I> {
     pub const fn new_controller(sink: I::Sink, state: InterfaceState) -> Self {
         Self {
             port: EdgePort::new_controller(sink, state),
+            generation: 0,
             #[cfg(feature = "std")]
             closer: None,
         }
+    }
+
+    /// Set the port's state, counting it if anything changed.
+    fn set_port_state(&mut self, state: InterfaceState) -> Result<(), SetStateError> {
+        let before = self.port.snapshot();
+        let res = self.port.set_state(state);
+        if self.port.snapshot() != before {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        res
     }
 
     /// Tear down the interface: stop any running workers and transition to `Down`.
@@ -75,7 +89,7 @@ impl<I: Interface> DirectEdge<I> {
         if let Some(closer) = self.closer.take() {
             closer.close();
         }
-        let _ = self.port.set_state(InterfaceState::Down);
+        let _ = self.set_port_state(InterfaceState::Down);
     }
 
     /// Store a closer WaitQueue so that workers are signaled when the
@@ -96,7 +110,7 @@ impl<I: Interface> Profile for DirectEdge<I> {
     fn send<T: Serialize>(&mut self, hdr: &Header, data: &T) -> Result<(), InterfaceSendError> {
         let mut hdr = hdr.clone();
         hdr.decrement_ttl()?;
-        self.port.send(&hdr, data)
+        self.port.send(&hdr, data, None)
     }
 
     fn send_err(
@@ -110,12 +124,12 @@ impl<I: Interface> Profile for DirectEdge<I> {
         }
         let mut hdr = hdr.clone();
         hdr.decrement_ttl()?;
-        self.port.send_err(&hdr, err)
+        self.port.send_err(&hdr, err, None)
     }
 
     fn send_raw(
         &mut self,
-        _hdr: &HeaderSeq,
+        _hdr: &Header,
         _data: &[u8],
         _source: Self::InterfaceIdent,
     ) -> Result<(), InterfaceSendError> {
@@ -133,7 +147,15 @@ impl<I: Interface> Profile for DirectEdge<I> {
         _ident: (),
         state: InterfaceState,
     ) -> Result<(), SetStateError> {
-        self.port.set_state(state)
+        self.set_port_state(state)
+    }
+
+    fn interface_node_id(&mut self, _ident: ()) -> Option<u8> {
+        Some(self.port.own_node_id())
+    }
+
+    fn state_generation(&self) -> u32 {
+        self.generation
     }
 }
 
@@ -144,8 +166,15 @@ impl<I: Interface> Profile for DirectEdge<I> {
 /// open — after construction or [`reset()`](crate::interface_manager::FrameProcessor::reset)
 /// (liveness timeout), including while a sticky ID is provisionally Active — and only from
 /// a frame that is plausibly addressed to this device: `dst.node_id` matches
-/// our role's node_id AND the profile does not already route
-/// `dst.network_id` somewhere else ([`Profile::is_transit_net`]).
+/// the node_id the interface owns ([`Profile::interface_node_id`]) or is a
+/// segment broadcast ([`BROADCAST_NODE_ID`]), AND the profile does not already
+/// route `dst.network_id` somewhere else ([`Profile::is_transit_net`]).
+///
+/// Discovery only ever changes the net_id. The node_id is whatever the
+/// interface owns — the role default on a point-to-point link, a claim
+/// candidate or claimed node_id on a bus — so a bus device neither loses its
+/// address to the point-to-point [`EDGE_NODE_ID`] nor has it overwritten when
+/// the link goes quiet and comes back.
 ///
 /// The guard exists for the bridge-upstream use of this processor: transit
 /// frames pass through an upstream with the dst nets of *other* segments,
@@ -159,10 +188,11 @@ impl<I: Interface> Profile for DirectEdge<I> {
 /// segment after a reboot).
 pub struct EdgeFrameProcessor {
     net_id: Option<u16>,
-    /// Our node_id on this link: [`EDGE_NODE_ID`] in target mode,
-    /// [`CENTRAL_NODE_ID`] in controller mode. Used both to filter which
-    /// frames may donate a net_id and as the node to (re)activate with.
-    own_node: u8,
+    /// Our role's default node_id: [`EDGE_NODE_ID`] in target mode,
+    /// [`CENTRAL_NODE_ID`] in controller mode. Only a fallback for profiles
+    /// that cannot report the interface's node_id
+    /// ([`Profile::interface_node_id`] returning `None`).
+    role_node: u8,
     /// Closed (`true`) once an Active interface has been observed or
     /// produced; while closed, frames are processed with zero profile
     /// queries. Cleared by `reset()`.
@@ -178,7 +208,7 @@ impl EdgeFrameProcessor {
     pub fn new() -> Self {
         Self {
             net_id: None,
-            own_node: EDGE_NODE_ID,
+            role_node: EDGE_NODE_ID,
             activated: false,
             rediscovering: false,
         }
@@ -188,7 +218,7 @@ impl EdgeFrameProcessor {
     pub fn new_controller(net_id: u16) -> Self {
         Self {
             net_id: Some(net_id),
-            own_node: CENTRAL_NODE_ID,
+            role_node: CENTRAL_NODE_ID,
             activated: false,
             rediscovering: false,
         }
@@ -254,11 +284,20 @@ where
     // with no profile queries at all.
     if !state.activated {
         let dst = frame.hdr.dst;
-        let can_donate = dst.network_id != 0 && dst.node_id == state.own_node;
         let discovery = nsh.stack().manage_profile(|im| {
             let if_state = im
                 .interface_state(ident.clone())
                 .ok_or("Frame for unknown interface")?;
+            // The node_id this interface owns — not the role default: on a
+            // bus it is the claim candidate or the claimed node_id, and it
+            // must survive (re)activation.
+            let own_node = im
+                .interface_node_id(ident.clone())
+                .unwrap_or(state.role_node);
+            // A broadcast is addressed to this segment's net too: the sending
+            // port stamps its own net_id with node 255.
+            let can_donate = dst.network_id != 0
+                && (dst.node_id == own_node || dst.node_id == BROADCAST_NODE_ID);
             match if_state {
                 // Already Active with a real net (pre-activated by
                 // registration code or reassigned by a seed router): adopt it
@@ -282,14 +321,14 @@ where
                         let already_active = matches!(
                             if_state,
                             InterfaceState::Active { net_id, node_id }
-                                if net_id == net && node_id == state.own_node
+                                if net_id == net && node_id == own_node
                         );
                         if !already_active {
                             im.set_interface_state(
                                 ident.clone(),
                                 InterfaceState::Active {
                                     net_id: net,
-                                    node_id: state.own_node,
+                                    node_id: own_node,
                                 },
                             )
                             .map_err(|_| "Failed to set interface state from frame")?;
@@ -327,10 +366,16 @@ where
             warn!("Dropping frame with src node_id 0 (stale or local packet received remotely)");
             return state_changed;
         }
-        if frame.hdr.src.node_id == state.own_node {
+        // Only link-local frames reach this check, so the profile query stays
+        // off the steady-state path.
+        let own_node = nsh
+            .stack()
+            .manage_profile(|im| im.interface_node_id(ident.clone()))
+            .unwrap_or(state.role_node);
+        if frame.hdr.src.node_id == own_node {
             warn!(
                 "Dropping frame with src node_id {} (spoofed as us)",
-                state.own_node
+                own_node
             );
             return state_changed;
         }
@@ -346,8 +391,8 @@ where
     let res = match frame.body {
         Ok(body) => nsh.stack().send_raw(&frame.hdr, body, ident),
         Err(e) => {
-            // send_err requires a Header instead of a HeaderSeq, so we convert it
-            let nshdr: Header = frame.hdr.clone().into();
+            // send_err requires a Header instead of a Header, so we convert it
+            let nshdr: Header = frame.hdr.clone();
             nsh.stack().send_err(&nshdr, e, Some(ident))
         }
     };

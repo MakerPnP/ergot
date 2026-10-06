@@ -71,11 +71,10 @@
 //!   exactly-once is not achievable over an unreliable transport; this is the
 //!   practical substitute.
 //!
-//! Note that the `seq_no` field in the header does **not** give you
-//! de-duplication today: an application-level retry is a fresh send with a fresh
-//! `seq_no`, so the receiver cannot use it to recognise a duplicate.
-//! Effectively-once therefore needs an application-level request id carried in the
-//! message body.
+//! Note that the frame header carries **no sequence number**: an application-level
+//! retry is simply a fresh send, and nothing in the header lets the receiver
+//! recognise a duplicate. Effectively-once therefore needs an application-level
+//! request id carried in the message body.
 //!
 //! ## Idempotency by design
 //!
@@ -108,12 +107,40 @@
 //!   `timeout_ms` it declares the link dead and transitions the interface state.
 //!   For a connectionless transport (UDP) the interface goes `Down` and the worker
 //!   exits, so you re-register for the next session; for a COBS stream (TCP,
-//!   serial, RTT) it goes `Inactive` and the workers keep running and recover when
-//!   frames resume, while a real transport error goes `Down`. With no liveness
-//!   configured, silence alone never changes the interface state.
-//! * A `state_notify` wait-queue is woken on **every interface state change**:
-//!   `Inactive → Active` on the first frame, `→ Inactive`/`Down` on a liveness
-//!   timeout, and on (de)registration. You `wait()` on it and react.
+//!   serial, RTT), a packet link or USB it goes `Inactive` and the workers keep
+//!   running and recover when frames resume, while a real transport error goes
+//!   `Down`. With no liveness configured, silence alone never changes the
+//!   interface state.
+//!
+//!   `Inactive` gates transmit, which suits the downstream end of a link: it
+//!   comes back when the peer's next frame arrives. The upstream end (an edge,
+//!   or a bridge's uplink) has to send to recover, e.g. a periodic link-local
+//!   ping, so build its worker with `revert_to_link_local_on_timeout()`: it
+//!   drops to link-local addressing instead and keeps sending. If both ends go
+//!   `Inactive`, neither can send and the link stays dead after it heals.
+//! * A `state_notify` wait-queue is woken on every state change **the worker
+//!   makes**: `Inactive → Active` on the first frame, `→ Inactive`/`Down` on a
+//!   liveness timeout, and when the worker exits (most workers also when they
+//!   start). Changes made elsewhere through `manage_profile`, such as the bus
+//!   address claim moving the device to a new node, do not reach it.
+//!
+//! [`NetStack::wait_profile`](crate::NetStack::wait_profile) covers both: it is
+//! woken after every interface state change made through `manage_profile`,
+//! whether a worker, a service or the application made it (for profiles that
+//! implement `Profile::state_generation`, as `DirectEdge` and `Router` do;
+//! with any other profile it is never woken). Give it a closure
+//! that reads the profile and returns `Some` once the condition holds; it runs
+//! right away and again after every change, and a change that lands between two
+//! runs is not missed. Wakeups are per stack, not per interface, and may
+//! coalesce, so the closure should check the state it cares about rather than
+//! treat wakeups as a log of every intermediate transition. Its wait queue is
+//! locked with the stack's own mutex type, so it follows whatever locking policy
+//! the application chose for the stack.
+//!
+//! If you do use `state_notify`, wait on it with `wait_for()`/`wait_for_value()`
+//! so the waiter is registered before the state is read. A bare `wait().await`
+//! followed by a state read can miss a transition that happens immediately
+//! before the waiter is linked.
 //!
 //! Each interface carries an `InterfaceState`:
 //!
@@ -124,10 +151,13 @@
 //!   worker exits and you re-register.
 //!
 //! The canonical reliability loop is therefore: register the interface with
-//! `liveness` and `state_notify`, `wait()` on the notify, and on each transition
-//! react — on `Active` mark the link up (and run any handshake), on `Inactive`
-//! wait a recovery window, on `Down` (or once the recovery window expires) tear
-//! down and reconnect.
+//! `liveness`, read and react to its initial state, then remember that state and
+//! call `wait_profile()` with a closure that returns `Some(current)` only when
+//! `current != last_state`. The comparison is checked right away and after every
+//! wake, without busy-looping on an unchanged `Some(InterfaceState)`. On `Active`
+//! mark the link up (and run any handshake), on `Inactive` wait a recovery
+//! window, and on `Down` (or once the recovery window expires) tear down and
+//! reconnect.
 //!
 //! ## Backpressure, lossiness, and the absence of QoS
 //!
@@ -149,13 +179,22 @@
 //! head-of-line-blocking the command path: under pressure, telemetry is what is
 //! lost, not commands.
 //!
+//! The header's **traffic class** (`Endpoint::CLASS` / `Topic::CLASS`, set with
+//! `class = ...` in the `endpoint!`/`topic!` macros) is how an application
+//! *labels* that split so an interface can act on it: mark the bulk stream
+//! `Bulk` or `Background` and the command path `Control`. It is a hint, not a
+//! policy — the netstack itself does not schedule, every send is still
+//! at-most-once, and an interface is free to ignore the class (the stream sinks
+//! do). Where the link has a native notion of priority (CAN arbitration) or the
+//! sink chooses to keep headroom for `Control`, the class is what drives it.
+//!
 //! ## Safety-critical systems: fail safe by absence
 //!
 //! The corollary of at-most-once is sharp for anything that can hurt someone: a
 //! "stop" command is **not** a safety guarantee, because it can be lost. Safety
 //! must instead be **fail-safe by absence** — a deadman. The actuator runs only
 //! while it receives continuous, positive affirmation, and the *loss* of that
-//! affirmation drives it to a safe state. The `liveness` → `state_notify` chain is
+//! affirmation drives it to a safe state. The `liveness` → `wait_profile` chain is
 //! exactly the "the controller went away" detector for this pattern.
 //!
 //! A subtlety worth internalizing: a link-loss gate that lives in the async

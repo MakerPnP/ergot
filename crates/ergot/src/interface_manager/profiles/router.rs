@@ -7,30 +7,23 @@
 //! Uses [`heapless::Vec`] for storage, `EdgePort` for per-interface state,
 //! and injectable [`RngCore`] for token generation.
 //!
-//! Requires either `std` or `nostd-seed-router` feature (for time and RNG).
-
-// `web-time` re-exports `std::time` on native targets, and provides a
-// `performance.now()`-based `Instant` on wasm32-unknown-unknown, where
-// `std::time::Instant::now()` panics.
-#[cfg(feature = "std")]
-use web_time::{Duration, Instant};
-
-#[cfg(all(not(feature = "std"), feature = "nostd-seed-router"))]
-use embassy_time::{Duration, Instant};
+//! Requires either `std` or `nostd-seed-router` feature (for the RNG, and for
+//! lease times from [`ergot::time`](crate::time)).
 
 use rand_core::RngCore;
 use serde::Serialize;
 
 use crate::{
-    Header, HeaderSeq, ProtocolError,
+    Header, ProtocolError,
     interface_manager::{
         AddressClaimError, AddressRefreshError, DelegatedRefreshPreparation, Interface,
         InterfaceSendError, InterfaceState, NodeClaimAssignment, Profile, SeedAssignmentError,
         SeedLease, SeedNetAssignment, SeedRefreshError, SetStateError,
-        edge_port::{CENTRAL_NODE_ID, EDGE_NODE_ID, EdgePort},
+        edge_port::{BROADCAST_NODE_ID, CENTRAL_NODE_ID, EDGE_NODE_ID, EdgePort},
     },
     logging::{debug, trace, warn},
     net_stack::NetStackHandle,
+    time::{Duration, Instant},
     wire_frames::de_frame,
 };
 
@@ -63,7 +56,7 @@ fn delegated_assignment(
 }
 
 fn remaining_lease_seconds(expiration: Instant, now: Instant) -> u16 {
-    let remaining = expiration - now;
+    let remaining = expiration.saturating_duration_since(now);
     let whole_seconds = remaining.as_secs();
     let rounded_up =
         whole_seconds.saturating_add(u64::from(remaining > Duration::from_secs(whole_seconds)));
@@ -79,8 +72,36 @@ struct Slot<I: Interface> {
     ident: u8,
     port: EdgePort<I>,
     net_id: u16,
+    /// node_ids reserved on this segment without the claim protocol (see
+    /// [`Router::reserve_static_node`]). Kept in the slot rather than in the
+    /// claim table, so they follow the segment across a net_id reassignment,
+    /// go away with it, and need no claim capacity (`C` may be 0).
+    static_nodes: NodeSet,
     #[cfg(feature = "std")]
     closer: Option<std::sync::Arc<maitake_sync::WaitQueue>>,
+}
+
+/// A set of node_ids, one bit each.
+#[derive(Clone, Copy)]
+struct NodeSet([u32; 8]);
+
+impl NodeSet {
+    const EMPTY: Self = Self([0; 8]);
+
+    fn contains(&self, node_id: u8) -> bool {
+        self.0[usize::from(node_id >> 5)] & (1 << (node_id & 31)) != 0
+    }
+
+    fn insert(&mut self, node_id: u8) {
+        self.0[usize::from(node_id >> 5)] |= 1 << (node_id & 31);
+    }
+
+    /// Returns whether `node_id` was in the set.
+    fn remove(&mut self, node_id: u8) -> bool {
+        let was = self.contains(node_id);
+        self.0[usize::from(node_id >> 5)] &= !(1 << (node_id & 31));
+        was
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +229,9 @@ impl LeaseKind {
         if token_match == TokenMatch::Replay {
             return Ok((*lease, true));
         }
-        if lease.expiration - now > Duration::from_secs(MIN_REFRESH_SECS as u64) {
+        if lease.expiration.saturating_duration_since(now)
+            > Duration::from_secs(MIN_REFRESH_SECS as u64)
+        {
             return Err(RefreshDenied::TooSoon);
         }
         lease.expiration = now + Duration::from_secs(MAX_LEASE_SECS as u64);
@@ -344,9 +367,19 @@ struct UpstreamPort<I: Interface> {
 struct SeedRoute {
     /// Direct downstream interface through which this network is reachable.
     via_ident: u8,
+    /// The node on that interface's segment that routes the network: the
+    /// device that requested (and refreshes) the lease. On a shared segment
+    /// this is the frame's next hop; on a point-to-point link it is the peer.
+    via_node: u8,
     /// Parent lease for delegated routes. Root-allocated routes have no
     /// parent because this router is their lease authority.
     parent: Option<SeedLease>,
+}
+
+/// Whether `node` can be a seed route's next hop: a real segment node, not
+/// "this node" (0) or the broadcast address.
+const fn is_route_node(node: u8) -> bool {
+    node != 0 && node != BROADCAST_NODE_ID
 }
 
 /// Reserved ident for the upstream interface (bridge mode).
@@ -362,7 +395,9 @@ pub const UPSTREAM_IDENT: u8 = u8::MAX;
 /// - `R`: RNG implementing [`RngCore`] for generating refresh tokens
 /// - `N`: Maximum number of directly connected downstream interfaces
 /// - `S`: Maximum number of seed-assigned routes (for bridge downstream networks)
-/// - `C`: Maximum number of bus-style node_id claims (address claim protocol)
+/// - `C`: Maximum number of bus-style node_id claims (address claim protocol).
+///   Node_ids reserved with [`reserve_static_node`](Self::reserve_static_node)
+///   do not count, so a bus with fixed addresses only can use `C = 0`.
 ///
 /// **Root mode** (`new`/`new_std`): no upstream, acts as a seed router.
 /// **Bridge mode** (`new_bridge`): has an upstream interface, forwards
@@ -381,6 +416,9 @@ pub struct Router<I: Interface, R: RngCore, const N: usize, const S: usize, cons
     node_claims: LeaseTable<u8, u64, C>,
     rng: R,
     upstream: Option<UpstreamPort<I>>,
+    /// Counts changes of any interface's state, and interfaces coming and
+    /// going; see [`Profile::state_generation`].
+    generation: u32,
 }
 
 /// Errors from [`Router::register_interface`].
@@ -403,6 +441,19 @@ pub enum DeregisterError {
     NotFound,
 }
 
+/// Errors from [`Router::reserve_static_node`].
+#[cfg_attr(feature = "defmt-v1", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum StaticNodeError {
+    /// No downstream interface with the given ident exists. (The upstream is
+    /// not one: this router does not assign addresses there.)
+    InterfaceNotFound,
+    /// 0 (any), [`CENTRAL_NODE_ID`], [`EDGE_NODE_ID`] or 255 (broadcast).
+    InvalidNodeId,
+    /// A device holds the node_id on this segment through the claim protocol.
+    AlreadyClaimed,
+}
+
 impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
     Router<I, R, N, S, C>
 {
@@ -418,6 +469,7 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
             node_claims: LeaseTable::new(),
             rng,
             upstream: None,
+            generation: 0,
         }
     }
 
@@ -438,7 +490,13 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
                 #[cfg(feature = "std")]
                 closer: None,
             }),
+            generation: 0,
         }
+    }
+
+    /// Note an interface state change for [`Profile::state_generation`].
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Returns `true` if this router has an upstream interface (bridge mode).
@@ -512,11 +570,13 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
                 ident,
                 port: EdgePort::new_controller(sink, state),
                 net_id,
+                static_nodes: NodeSet::EMPTY,
                 #[cfg(feature = "std")]
                 closer: None,
             })
             .ok()
             .expect("push after is_full check");
+        self.bump_generation();
 
         Ok(ident)
     }
@@ -543,11 +603,13 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
                 ident,
                 port: EdgePort::new_controller(sink, InterfaceState::Down),
                 net_id: 0,
+                static_nodes: NodeSet::EMPTY,
                 #[cfg(feature = "std")]
                 closer: None,
             })
             .ok()
             .expect("push after is_full check");
+        self.bump_generation();
 
         Ok(ident)
     }
@@ -555,8 +617,8 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
     /// Remove a downstream interface by ident.
     ///
     /// Also tombstones any seed routes reachable through this interface, and
-    /// drops any bus node_id claims scoped to its net_id (the segment is gone,
-    /// and its net_id may be reused).
+    /// drops any bus node_id claims scoped to its net_id and its static
+    /// node_ids (the segment is gone, and its net_id may be reused).
     pub fn deregister_interface(&mut self, ident: u8) -> Result<(), DeregisterError> {
         let pos = self
             .slots
@@ -565,6 +627,7 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
             .ok_or(DeregisterError::NotFound)?;
 
         let slot = self.slots.swap_remove(pos);
+        self.bump_generation();
 
         // Signal workers to stop
         #[cfg(feature = "std")]
@@ -589,6 +652,62 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
         self.node_claims.drop_scope(slot.net_id);
 
         Ok(())
+    }
+
+    /// Reserve `node_id` on the bus segment behind downstream interface
+    /// `ident`, for a device with a fixed address (from a DIP switch or its
+    /// configuration) that does not use the address claim protocol.
+    ///
+    /// The device may send from `node_id` as if it had claimed it, and no
+    /// claim for it is granted. It starts at `Active { net_id: 0, node_id }`
+    /// and learns the segment's net_id from the first frame addressed to it.
+    ///
+    /// The reservation belongs to the interface: it survives a net_id
+    /// reassignment, and goes away with [`deregister_interface`]. It may be
+    /// made while the interface is still pending a net_id. Reserving a
+    /// node_id twice is not an error.
+    ///
+    /// [`deregister_interface`]: Self::deregister_interface
+    pub fn reserve_static_node(&mut self, ident: u8, node_id: u8) -> Result<(), StaticNodeError> {
+        if matches!(node_id, 0 | CENTRAL_NODE_ID | EDGE_NODE_ID | 255) {
+            return Err(StaticNodeError::InvalidNodeId);
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.ident == ident)
+            .ok_or(StaticNodeError::InterfaceNotFound)?;
+        // A pending slot (net_id 0) has no claims: none are granted on net 0.
+        if slot.net_id != 0
+            && self
+                .node_claims
+                .get(node_id, slot.net_id)
+                .is_some_and(|e| e.kind.is_active(Instant::now()))
+        {
+            return Err(StaticNodeError::AlreadyClaimed);
+        }
+        slot.static_nodes.insert(node_id);
+        Ok(())
+    }
+
+    /// Release a reservation made with
+    /// [`reserve_static_node`](Self::reserve_static_node). Returns whether
+    /// `node_id` was reserved on interface `ident`.
+    pub fn release_static_node(&mut self, ident: u8, node_id: u8) -> bool {
+        self.slots
+            .iter_mut()
+            .find(|s| s.ident == ident)
+            .is_some_and(|s| s.static_nodes.remove(node_id))
+    }
+
+    /// Whether `node_id` is reserved on the segment with `net_id` (never on
+    /// the pending placeholder net_id 0).
+    fn is_static_node(&self, net_id: u16, node_id: u8) -> bool {
+        net_id != 0
+            && self
+                .slots
+                .iter()
+                .any(|s| s.net_id == net_id && s.static_nodes.contains(node_id))
     }
 
     /// Get the net_id for a given ident, if it exists.
@@ -628,14 +747,16 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
             .collect()
     }
 
-    /// Find the EdgePort to send through for a given destination net_id.
+    /// Find the EdgePort to send through for a given destination net_id, and
+    /// the node on its segment to hand the frame to when the destination is
+    /// not on that segment (a seed route's next hop).
     ///
     /// Searches direct slots first, then seed routes.
     fn find(
         &mut self,
         hdr: &Header,
         source: Option<u8>,
-    ) -> Result<&mut EdgePort<I>, InterfaceSendError> {
+    ) -> Result<(&mut EdgePort<I>, Option<u8>), InterfaceSendError> {
         if hdr.dst.port_id == 0 && hdr.any_all.is_none() {
             return Err(InterfaceSendError::AnyPortMissingKey);
         }
@@ -660,15 +781,17 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
             {
                 return Err(InterfaceSendError::RoutingLoop);
             }
-            return Ok(&mut self.slots[pos].port);
+            return Ok((&mut self.slots[pos].port, None));
         }
 
         // 2. Seed route lookup (gc above already tombstoned expired routes).
         //    net_id is the unique key, so look up by key alone.
-        let via_ident = match self.seed_routes.by_key(hdr.dst.network_id) {
+        let (via_ident, via_node) = match self.seed_routes.by_key(hdr.dst.network_id) {
             // 3. Upstream fallback (bridge mode)
-            None => return self.find_upstream(source),
-            Some(entry) if entry.kind.is_active(Instant::now()) => entry.extra.via_ident,
+            None => return self.find_upstream(source).map(|port| (port, None)),
+            Some(entry) if entry.kind.is_active(Instant::now()) => {
+                (entry.extra.via_ident, entry.extra.via_node)
+            }
             Some(_) => return Err(InterfaceSendError::NoRouteToDest),
         };
 
@@ -690,7 +813,7 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize>
                 InterfaceSendError::NoRouteToDest
             })?;
 
-        Ok(&mut self.slots[pos].port)
+        Ok((&mut self.slots[pos].port, Some(via_node)))
     }
 
     /// Try to route through the upstream interface (bridge mode only).
@@ -763,14 +886,19 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
                 if slot.net_id == 0 {
                     continue;
                 }
+                // The port addresses the broadcast to every node on its
+                // segment (node 255).
                 let mut bhdr = hdr.clone();
                 bhdr.dst.network_id = slot.net_id;
-                bhdr.dst.node_id = EDGE_NODE_ID;
-                fold_broadcast_leg(slot.port.send(&bhdr, data), &mut any_good, &mut genuine);
+                fold_broadcast_leg(
+                    slot.port.send(&bhdr, data, None),
+                    &mut any_good,
+                    &mut genuine,
+                );
             }
             // Also broadcast to upstream (bridge mode)
             if let Some(up) = self.upstream.as_mut() {
-                fold_broadcast_leg(up.port.send(&hdr, data), &mut any_good, &mut genuine);
+                fold_broadcast_leg(up.port.send(&hdr, data, None), &mut any_good, &mut genuine);
             }
             if any_good {
                 Ok(())
@@ -780,8 +908,8 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
                 Err(InterfaceSendError::NoRouteToDest)
             }
         } else {
-            let port = self.find(&hdr, None)?;
-            port.send(&hdr, data)
+            let (port, via) = self.find(&hdr, None)?;
+            port.send(&hdr, data, via)
         }
     }
 
@@ -793,13 +921,13 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
     ) -> Result<(), InterfaceSendError> {
         let mut hdr = hdr.clone();
         hdr.decrement_ttl()?;
-        let port = self.find(&hdr, source)?;
-        port.send_err(&hdr, err)
+        let (port, via) = self.find(&hdr, source)?;
+        port.send_err(&hdr, err, via)
     }
 
     fn send_raw(
         &mut self,
-        hdr: &HeaderSeq,
+        hdr: &Header,
         data: &[u8],
         source: Self::InterfaceIdent,
     ) -> Result<(), InterfaceSendError> {
@@ -825,16 +953,25 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
                 }
                 default_error = InterfaceSendError::NoRouteToDest;
 
+                // The port addresses the broadcast to every node on its
+                // segment (node 255).
                 hdr.dst.network_id = slot.net_id;
-                hdr.dst.node_id = EDGE_NODE_ID;
-                fold_broadcast_leg(slot.port.send_raw(&hdr, data), &mut any_good, &mut genuine);
+                fold_broadcast_leg(
+                    slot.port.send_raw(&hdr, data, None),
+                    &mut any_good,
+                    &mut genuine,
+                );
             }
             // Also broadcast to upstream (bridge mode), unless source is upstream
             if let Some(up) = self.upstream.as_mut()
                 && source != UPSTREAM_IDENT
             {
                 default_error = InterfaceSendError::NoRouteToDest;
-                fold_broadcast_leg(up.port.send_raw(&hdr, data), &mut any_good, &mut genuine);
+                fold_broadcast_leg(
+                    up.port.send_raw(&hdr, data, None),
+                    &mut any_good,
+                    &mut genuine,
+                );
             }
             if any_good {
                 Ok(())
@@ -844,9 +981,9 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
                 Err(default_error)
             }
         } else {
-            let nshdr: Header = hdr.clone().into();
-            let port = self.find(&nshdr, Some(source))?;
-            port.send_raw(&hdr, data)
+            let nshdr: Header = hdr.clone();
+            let (port, via) = self.find(&nshdr, Some(source))?;
+            port.send_raw(&hdr, data, via)
         }
     }
 
@@ -860,25 +997,34 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
             .map(|s| s.port.state())
     }
 
+    fn interface_node_id(&mut self, ident: Self::InterfaceIdent) -> Option<u8> {
+        if ident == UPSTREAM_IDENT {
+            return self.upstream.as_ref().map(|up| up.port.own_node_id());
+        }
+        self.slots
+            .iter()
+            .find(|s| s.ident == ident)
+            .map(|s| s.port.own_node_id())
+    }
+
     fn set_interface_state(
         &mut self,
         ident: Self::InterfaceIdent,
         state: InterfaceState,
     ) -> Result<(), SetStateError> {
         if ident == UPSTREAM_IDENT {
-            return self
+            let up = self
                 .upstream
                 .as_mut()
-                .ok_or(SetStateError::InterfaceNotFound)?
-                .port
-                .set_state(state);
+                .ok_or(SetStateError::InterfaceNotFound)?;
+            return set_counted(&mut up.port, state, &mut self.generation);
         }
         let slot = self
             .slots
             .iter_mut()
             .find(|s| s.ident == ident)
             .ok_or(SetStateError::InterfaceNotFound)?;
-        slot.port.set_state(state)
+        set_counted(&mut slot.port, state, &mut self.generation)
     }
 
     fn reassign_interface_net_id(
@@ -909,7 +1055,8 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
         // Purge node claims scoped to the net_id being replaced. Otherwise they
         // linger and, if that net_id is later handed to a different interface,
         // would validate foreign frames or block legitimate re-claims on the new
-        // bus. (deregister_interface does the same.)
+        // bus. (deregister_interface does the same.) Static node_ids stay: they
+        // belong to the segment, whatever its net_id.
         if old_net_id != new_net_id {
             self.node_claims.drop_scope(old_net_id);
         }
@@ -920,15 +1067,20 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
             .find(|s| s.ident == ident)
             .ok_or(SetStateError::InterfaceNotFound)?;
         slot.net_id = new_net_id;
-        slot.port.set_state(InterfaceState::Active {
-            net_id: new_net_id,
-            node_id: CENTRAL_NODE_ID,
-        })
+        set_counted(
+            &mut slot.port,
+            InterfaceState::Active {
+                net_id: new_net_id,
+                node_id: CENTRAL_NODE_ID,
+            },
+            &mut self.generation,
+        )
     }
 
     fn request_seed_net_assign(
         &mut self,
         source_net: u16,
+        source_node: u8,
     ) -> Result<SeedNetAssignment, SeedAssignmentError> {
         if self.has_upstream() {
             return Err(SeedAssignmentError::ProfileCantSeed);
@@ -936,7 +1088,7 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
         // net_id 0 is the pending placeholder, not a real source segment. Reject it
         // explicitly so a request arriving on a not-yet-assigned slot can't match a
         // pending slot and be granted an assignment scoped to net 0.
-        if source_net == 0 {
+        if source_net == 0 || !is_route_node(source_node) {
             return Err(SeedAssignmentError::UnknownSource);
         }
         let now = Instant::now();
@@ -963,6 +1115,7 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
             source_net,
             SeedRoute {
                 via_ident,
+                via_node: source_node,
                 parent: None,
             },
             LeaseKind::active(now, INITIAL_LEASE_SECS, refresh_token),
@@ -999,12 +1152,13 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
     fn register_delegated_seed_net(
         &mut self,
         source_net: u16,
+        source_node: u8,
         parent: &SeedLease,
     ) -> Result<SeedNetAssignment, SeedAssignmentError> {
         let now = Instant::now();
         self.seed_routes.gc(now);
 
-        if source_net == 0 {
+        if source_net == 0 || !is_route_node(source_node) {
             return Err(SeedAssignmentError::UnknownSource);
         }
 
@@ -1052,6 +1206,7 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
             source_net,
             SeedRoute {
                 via_ident,
+                via_node: source_node,
                 parent: Some(parent.clone()),
             },
             LeaseKind::active(now, parent.expires_seconds, refresh_token),
@@ -1113,11 +1268,15 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
     fn commit_delegated_refresh(
         &mut self,
         source_net: u16,
+        source_node: u8,
         refresh_token: [u8; 8],
         refreshed_parent: &SeedLease,
     ) -> Result<SeedNetAssignment, SeedRefreshError> {
         if refreshed_parent.min_refresh_seconds <= SEED_DELEGATION_REFRESH_MARGIN {
             return Err(SeedRefreshError::DelegationDepthExceeded);
+        }
+        if !is_route_node(source_node) {
+            return Err(SeedRefreshError::BadRequest);
         }
         let req_token = u64::from_le_bytes(refresh_token);
         let new_token = self.rng.next_u64();
@@ -1146,6 +1305,9 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
                     .as_mut()
                     .ok_or(SeedRefreshError::NotAssigned)?;
                 *parent = refreshed_parent.clone();
+                // The token proves the requester holds this lease; if it now
+                // sits at another node (it re-claimed), follow it.
+                entry.extra.via_node = source_node;
                 lease.expiration =
                     now + Duration::from_secs(refreshed_parent.expires_seconds as u64);
                 lease.previous_refresh_token = Some(lease.refresh_token);
@@ -1234,9 +1396,13 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
     fn refresh_seed_net_assignment(
         &mut self,
         source_net: u16,
+        source_node: u8,
         refresh_net: u16,
         refresh_token: [u8; 8],
     ) -> Result<SeedNetAssignment, SeedRefreshError> {
+        if !is_route_node(source_node) {
+            return Err(SeedRefreshError::BadRequest);
+        }
         let req_token = u64::from_le_bytes(refresh_token);
         // Pre-generate the new token before borrowing seed_routes.
         let new_token = self.rng.next_u64();
@@ -1249,7 +1415,13 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
             .get_mut(refresh_net, source_net)
             .ok_or(SeedRefreshError::UnknownNetId)?;
 
-        match entry.kind.refresh(req_token, now, new_token, true) {
+        let refreshed = entry.kind.refresh(req_token, now, new_token, true);
+        if refreshed.is_ok() {
+            // The token proves the requester holds this lease; if it now sits
+            // at another node (it re-claimed), follow it.
+            entry.extra.via_node = source_node;
+        }
+        match refreshed {
             Ok((lease, replayed)) => Ok(SeedNetAssignment {
                 net_id: refresh_net,
                 expires_seconds: if replayed {
@@ -1288,6 +1460,11 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
         // a not-yet-assigned slot and grant a claim scoped to net 0.
         if source_net == 0 || !self.slots.iter().any(|s| s.net_id == source_net) {
             return Err(AddressClaimError::UnknownSource);
+        }
+
+        // A fixed-address device owns the candidate on this bus.
+        if self.is_static_node(source_net, candidate) {
+            return Err(AddressClaimError::Conflict);
         }
 
         // Check if the candidate is already claimed on this bus.
@@ -1379,6 +1556,9 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
         if node_id == CENTRAL_NODE_ID || node_id == EDGE_NODE_ID {
             return true;
         }
+        if self.is_static_node(net_id, node_id) {
+            return true;
+        }
         // Scoped to the net_id the frame arrived on: a claim only validates
         // frames on its own bus segment. is_active() rejects an expired claim
         // immediately, so a quiet bus can't keep a stale node_id alive.
@@ -1398,6 +1578,24 @@ impl<I: Interface, R: RngCore, const N: usize, const S: usize, const C: usize> P
         self.slots.iter().any(|s| s.net_id == net_id)
             || self.seed_routes.contains_key_at(net_id, Instant::now())
     }
+
+    fn state_generation(&self) -> u32 {
+        self.generation
+    }
+}
+
+/// Set a port's state, counting it in `generation` if anything changed.
+fn set_counted<I: Interface>(
+    port: &mut EdgePort<I>,
+    state: InterfaceState,
+    generation: &mut u32,
+) -> Result<(), SetStateError> {
+    let before = port.snapshot();
+    let res = port.set_state(state);
+    if port.snapshot() != before {
+        *generation = generation.wrapping_add(1);
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,6 +1668,7 @@ mod tests {
             1,
             SeedRoute {
                 via_ident: 0,
+                via_node: EDGE_NODE_ID,
                 parent: None,
             },
             LeaseKind::Tombstone {
@@ -1620,7 +1819,7 @@ pub fn process_frame<N>(
     }
 
     let hdr = frame.hdr.clone();
-    let nshdr: Header = hdr.clone().into();
+    let nshdr: Header = hdr.clone();
 
     let res = match frame.body {
         Ok(body) => nsh.stack().send_raw(&hdr, body, ident.clone()),
@@ -1650,8 +1849,8 @@ pub fn process_frame<N>(
                     src: hdr.dst,
                     dst: hdr.src,
                     any_all: None,
-                    seq_no: Some(hdr.seq_no),
                     kind: crate::FrameKind::PROTOCOL_ERROR,
+                    class: hdr.class,
                     ttl: crate::DEFAULT_TTL,
                 };
                 let _ = nsh.stack().send_err(
@@ -1661,8 +1860,8 @@ pub fn process_frame<N>(
                 );
             }
         }
-        Err(e) => {
-            warn!("{} recv->send error: {:?}", hdr, e);
+        Err(_e) => {
+            warn!("{} recv->send error: {:?}", hdr, _e);
         }
     }
 }

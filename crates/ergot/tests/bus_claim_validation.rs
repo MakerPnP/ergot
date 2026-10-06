@@ -9,20 +9,24 @@
 #![cfg(feature = "tokio-std")]
 #![cfg(not(miri))]
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ergot::{
-    Address, FrameKind, HeaderSeq, ProtocolError,
+    Address, FrameKind, Header, ProtocolError,
     interface_manager::{
-        FrameProcessor, Interface, InterfaceSink, Profile,
+        AddressClaimError, FrameProcessor, Interface, InterfaceSink, LinkMeta, Profile,
         profiles::router::{Router, RouterFrameProcessor},
     },
     net_stack::ArcNetStack,
     wire_frames,
 };
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
-use rand::SeedableRng;
+use rand::{SeedableRng, rngs::StdRng};
 use serde::Serialize;
+use tokio::time::sleep;
 
 // --- Sink that captures forwarded frames ---
 
@@ -35,15 +39,15 @@ impl InterfaceSink for CaptureSink {
     fn mtu(&self) -> u16 {
         2048
     }
-    fn send_ty<T: Serialize>(&mut self, hdr: &HeaderSeq, _body: &T) -> Result<(), ()> {
+    fn send_ty<T: Serialize>(&mut self, _: &LinkMeta, hdr: &Header, _body: &T) -> Result<(), ()> {
         self.frames.lock().unwrap().push((hdr.src, hdr.dst));
         Ok(())
     }
-    fn send_raw(&mut self, hdr: &HeaderSeq, _body: &[u8]) -> Result<(), ()> {
+    fn send_raw(&mut self, _: &LinkMeta, hdr: &Header, _body: &[u8]) -> Result<(), ()> {
         self.frames.lock().unwrap().push((hdr.src, hdr.dst));
         Ok(())
     }
-    fn send_err(&mut self, hdr: &HeaderSeq, _err: ProtocolError) -> Result<(), ()> {
+    fn send_err(&mut self, _: &LinkMeta, hdr: &Header, _err: ProtocolError) -> Result<(), ()> {
         self.frames.lock().unwrap().push((hdr.src, hdr.dst));
         Ok(())
     }
@@ -59,7 +63,7 @@ type TestRouter = Router<MockInterface, rand::rngs::StdRng, 8, 8, 4>;
 type TestStack = ArcNetStack<CriticalSectionRawMutex, TestRouter>;
 
 fn make_frame(src_net: u16, src_node: u8, dst_net: u16, dst_node: u8, dst_port: u8) -> Vec<u8> {
-    let hdr = HeaderSeq {
+    let hdr = Header {
         src: Address {
             network_id: src_net,
             node_id: src_node,
@@ -71,9 +75,9 @@ fn make_frame(src_net: u16, src_node: u8, dst_net: u16, dst_node: u8, dst_port: 
             port_id: dst_port,
         },
         any_all: None,
-        seq_no: 0,
         kind: FrameKind::ENDPOINT_REQ,
-        ttl: 16,
+        class: ergot::TrafficClass::Normal,
+        ttl: 15,
     };
     wire_frames::encode_frame_ty(postcard::ser_flavors::StdVec::new(), &hdr, &42u32).unwrap()
 }
@@ -356,5 +360,46 @@ fn node_claim_with_source_net_zero_is_rejected() {
     assert!(
         res.is_err(),
         "a claim scoped to net 0 (the pending placeholder) must be rejected, got {res:?}"
+    );
+}
+
+/// Leases run on the time backend (tokio's here), so their whole life can be
+/// tested on paused time: an unrefreshed claim expires with its initial
+/// lease, stays reserved as a tombstone for the grace period, then frees up.
+#[tokio::test(start_paused = true)]
+async fn an_unrefreshed_claim_expires_then_frees_after_its_grace() {
+    let stack: TestStack = TestStack::new_with_profile(Router::new(StdRng::from_seed([6u8; 32])));
+    let bus_ident = stack
+        .manage_profile(|im| {
+            im.register_interface(CaptureSink {
+                frames: Arc::new(Mutex::new(Vec::new())),
+            })
+        })
+        .unwrap();
+    let bus_net = stack.manage_profile(|im| im.net_id_of(bus_ident)).unwrap();
+    let claimed = || stack.manage_profile(|im| im.is_node_claimed(bus_net, 50));
+    let other_device_claims =
+        || stack.manage_profile(|im| im.request_node_claim(bus_net, 50, 0xBBBB));
+
+    let lease = stack
+        .manage_profile(|im| im.request_node_claim(bus_net, 50, 0xAAAA))
+        .unwrap();
+    let lease_secs = u64::from(lease.expires_seconds);
+
+    sleep(Duration::from_secs(lease_secs - 1)).await;
+    assert!(claimed(), "still inside the lease");
+
+    sleep(Duration::from_secs(2)).await;
+    assert!(!claimed(), "the lease ran out");
+    assert_eq!(
+        other_device_claims().err(),
+        Some(AddressClaimError::Conflict),
+        "the node_id is still reserved for the grace period"
+    );
+
+    sleep(Duration::from_secs(30)).await;
+    assert!(
+        other_device_claims().is_ok(),
+        "the node_id is free after the grace period"
     );
 }

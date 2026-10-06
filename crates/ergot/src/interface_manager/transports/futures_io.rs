@@ -11,10 +11,11 @@
 //! - **Graceful shutdown**: [`RxWorker::with_closer`] — a
 //!   [`maitake_sync::WaitQueue`] that ends the loop when woken or closed.
 //! - **State change notifications**: [`RxWorker::with_state_notify`] — woken
-//!   whenever the interface state changes (frame processing or liveness).
-//! - **Liveness timeout**: [`RxWorker::run_with_liveness`] — takes a
-//!   `sleeper` closure so any runtime's timer can drive it (e.g.
-//!   `tokio::time::sleep`, `gloo_timers::future::sleep`).
+//!   whenever this worker changes the interface state (frame processing,
+//!   liveness, exit); see [`NetStack::wait_profile`](crate::NetStack::wait_profile)
+//!   for changes made elsewhere.
+//! - **Liveness timeout**: `RxWorker::run_with_liveness`, timed by the
+//!   [time backend](crate::time) (`tokio-std`, `wasm`, ...).
 //!
 //! The caller is responsible for setting the initial interface state before
 //! running the worker. On exit (or drop), the interface is set to
@@ -24,14 +25,15 @@
 //! [`DirectEdge`]: crate::interface_manager::profiles::direct_edge::DirectEdge
 //! [`Router`]: crate::interface_manager::profiles::router::Router
 
-use core::future::Future;
-use core::pin::Pin;
+use core::{future::pending, pin::Pin};
 use std::sync::Arc;
 
 use cobs_acc::{CobsAccumulator, FeedResult};
 use embassy_futures::select::{Either3, select3};
 use maitake_sync::WaitQueue;
 
+#[cfg(time_sleep)]
+use crate::time::{Duration, sleep};
 use crate::{
     interface_manager::{FrameProcessor, InterfaceState, LivenessConfig, Profile},
     net_stack::NetStackHandle,
@@ -100,9 +102,11 @@ where
         }
     }
 
-    /// On a liveness timeout, revert the interface to the link-local edge boot
-    /// state ([`InterfaceState::edge_link_local`]) instead of
-    /// [`InterfaceState::Inactive`].
+    /// On a liveness timeout, revert the interface to link-local addressing
+    /// ([`InterfaceState::link_local`], keeping its node_id) instead of
+    /// [`InterfaceState::Inactive`]. On a point-to-point link that is the edge
+    /// boot state ([`InterfaceState::edge_link_local`]); a bus device keeps
+    /// the node_id it claimed.
     ///
     /// Use this for an edge or bridge upstream. `Inactive` gates transmit until
     /// frames resume, which is correct for a downstream peer but wrong for an
@@ -129,8 +133,12 @@ where
         self
     }
 
-    /// Wake `notify` whenever the interface state changes (e.g. a frame
-    /// activates the interface, or a liveness timeout deactivates it).
+    /// Wake `notify` whenever this worker changes the interface state (e.g.
+    /// a frame activates the interface, or a liveness timeout deactivates
+    /// it). Changes made elsewhere, such as the bus address claim, do not
+    /// reach it; wait with
+    /// [`NetStack::wait_profile`](crate::NetStack::wait_profile) to see
+    /// every change.
     pub fn with_state_notify(mut self, notify: Arc<WaitQueue>) -> Self {
         self.state_notify = Some(notify);
         self
@@ -152,55 +160,36 @@ where
         frame: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<RxEnd, std::io::Error> {
-        let res = self
-            .run_inner(
-                frame,
-                scratch,
-                None::<(_, fn(u64) -> core::future::Pending<()>)>,
-            )
-            .await;
+        let res = self.run_inner(frame, scratch, None).await;
         self.set_down();
         res
     }
 
-    /// Run the receive loop with a liveness timeout.
+    /// Run the receive loop with a liveness timeout (needs a [time
+    /// backend](crate::time)).
     ///
     /// Once at least one frame has been received, going `liveness.timeout_ms`
     /// milliseconds without a frame transitions the interface to
     /// [`InterfaceState::Inactive`] and resets the processor; the loop keeps
     /// running and recovers when frames resume.
-    ///
-    /// `sleeper` provides the timer: a closure from milliseconds to a future
-    /// that resolves after that long (e.g.
-    /// `|ms| tokio::time::sleep(Duration::from_millis(ms))`).
-    pub async fn run_with_liveness<S, F>(
+    #[cfg(time_sleep)]
+    pub async fn run_with_liveness(
         &mut self,
         frame: &mut [u8],
         scratch: &mut [u8],
         liveness: LivenessConfig,
-        sleeper: S,
-    ) -> Result<RxEnd, std::io::Error>
-    where
-        S: Fn(u64) -> F,
-        F: Future<Output = ()>,
-    {
-        let res = self
-            .run_inner(frame, scratch, Some((liveness, sleeper)))
-            .await;
+    ) -> Result<RxEnd, std::io::Error> {
+        let res = self.run_inner(frame, scratch, Some(liveness)).await;
         self.set_down();
         res
     }
 
-    async fn run_inner<S, F>(
+    async fn run_inner(
         &mut self,
         frame: &mut [u8],
         scratch: &mut [u8],
-        liveness: Option<(LivenessConfig, S)>,
-    ) -> Result<RxEnd, std::io::Error>
-    where
-        S: Fn(u64) -> F,
-        F: Future<Output = ()>,
-    {
+        liveness: Option<LivenessConfig>,
+    ) -> Result<RxEnd, std::io::Error> {
         let mut acc = CobsAccumulator::new(frame);
         let closer = self.closer.clone();
         let mut have_received = false;
@@ -212,14 +201,20 @@ where
                         // Both a wake and a close mean "shut down".
                         let _ = c.wait().await;
                     }
-                    None => core::future::pending().await,
+                    None => pending().await,
                 }
             };
             let timeout_fut = async {
-                match &liveness {
-                    Some((cfg, sleeper)) if have_received => sleeper(cfg.timeout_ms).await,
-                    _ => core::future::pending().await,
+                #[cfg(time_sleep)]
+                if let Some(cfg) = &liveness
+                    && have_received
+                {
+                    return sleep(Duration::from_millis(cfg.timeout_ms)).await;
                 }
+                // No time backend: `run_with_liveness` does not exist.
+                #[cfg(not(time_sleep))]
+                let _ = (&liveness, have_received);
+                pending().await
             };
 
             let used =
@@ -264,20 +259,26 @@ where
     /// Handle a liveness timeout: move the interface out of `Active` (if it is
     /// active) and reset the processor so the next frame triggers re-discovery.
     ///
-    /// The target state is [`InterfaceState::Inactive`] by default, or the
-    /// link-local edge boot state if [`revert_to_link_local_on_timeout`] was
+    /// The target state is [`InterfaceState::Inactive`] by default, or
+    /// link-local with the current node_id if [`revert_to_link_local_on_timeout`] was
     /// set (see that method for the rationale).
     ///
     /// [`revert_to_link_local_on_timeout`]: Self::revert_to_link_local_on_timeout
     fn liveness_timeout(&mut self) {
-        let target = if self.link_local_on_timeout {
-            InterfaceState::edge_link_local()
-        } else {
-            InterfaceState::Inactive
-        };
+        let link_local = self.link_local_on_timeout;
         let changed = self.nsh.stack().manage_profile(|im| {
             let current = im.interface_state(self.ident.clone());
-            if matches!(current, Some(InterfaceState::Active { .. })) && current != Some(target) {
+            let Some(InterfaceState::Active { node_id, .. }) = current else {
+                return false;
+            };
+            // Link-local keeps the node_id: a bus device must not fall back
+            // to the point-to-point EDGE_NODE_ID.
+            let target = if link_local {
+                InterfaceState::link_local(node_id)
+            } else {
+                InterfaceState::Inactive
+            };
+            if current != Some(target) {
                 _ = im.set_interface_state(self.ident.clone(), target);
                 true
             } else {

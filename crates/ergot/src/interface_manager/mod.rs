@@ -34,7 +34,7 @@
 //!
 //! [`NetStack`]: crate::NetStack
 
-use crate::{Header, HeaderSeq, ProtocolError};
+use crate::{Header, ProtocolError};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 
@@ -252,7 +252,7 @@ pub trait Profile {
     /// This method should only be used for messages that do NOT originate locally
     fn send_raw(
         &mut self,
-        hdr: &HeaderSeq,
+        hdr: &Header,
         data: &[u8],
         source: Self::InterfaceIdent,
     ) -> Result<(), InterfaceSendError>;
@@ -269,15 +269,57 @@ pub trait Profile {
         state: InterfaceState,
     ) -> Result<(), SetStateError>;
 
+    /// The node_id the given interface owns on its segment.
+    ///
+    /// Unlike [`interface_state`](Profile::interface_state), this survives
+    /// states that carry no node_id ([`InterfaceState::Inactive`] after a
+    /// liveness timeout): a bus device keeps the node_id it claimed while its
+    /// link is quiet, and must reactivate with it rather than a role default.
+    ///
+    /// The default derives it from the current state, so it is `None` while
+    /// the interface is `Down` or `Inactive`.
+    fn interface_node_id(&mut self, ident: Self::InterfaceIdent) -> Option<u8> {
+        match self.interface_state(ident)? {
+            InterfaceState::Active { node_id, .. } | InterfaceState::ActiveLocal { node_id } => {
+                Some(node_id)
+            }
+            InterfaceState::Down | InterfaceState::Inactive => None,
+        }
+    }
+
+    /// A counter that changes whenever any interface's state changes (or an
+    /// interface comes or goes).
+    ///
+    /// [`NetStack::manage_profile`] compares it before and after each call and
+    /// wakes [`NetStack::wait_profile`], so everything that waits on interface
+    /// state — a transport following its node_id, an application watching a
+    /// link — learns about changes made anywhere, including by services such
+    /// as the bus address claim. Only whether it changed matters; it may
+    /// wrap.
+    ///
+    /// The default never changes: a profile without it sends no
+    /// notifications.
+    ///
+    /// [`NetStack::manage_profile`]: crate::NetStack::manage_profile
+    /// [`NetStack::wait_profile`]: crate::NetStack::wait_profile
+    fn state_generation(&self) -> u32 {
+        0
+    }
+
     /// Request a Net ID assignment from this profile
+    ///
+    /// `source_net` is the segment the request arrived on and `source_node`
+    /// the requester's node on it: the device the new net is reached through.
+    /// On a shared segment that node is the next hop for the net.
     ///
     /// For Profiles that are not (currently acting as) a Seed Router, this method will always return
     /// an error.
     fn request_seed_net_assign(
         &mut self,
         source_net: u16,
+        source_node: u8,
     ) -> Result<SeedNetAssignment, SeedAssignmentError> {
-        _ = source_net;
+        _ = (source_net, source_node);
         Err(SeedAssignmentError::ProfileCantSeed)
     }
 
@@ -319,7 +361,8 @@ pub trait Profile {
         Err(AddressRefreshError::NotSupported)
     }
 
-    /// Check if a node_id is valid (claimed) on the given net_id.
+    /// Check if a node_id is valid (claimed, or reserved as a static address)
+    /// on the given net_id.
     ///
     /// Returns `true` if the node_id is allowed to send frames on this
     /// interface. The default implementation has no claim table, so it accepts
@@ -374,17 +417,18 @@ pub trait Profile {
     }
 
     /// Register a seed route leased from the upstream seed router on behalf
-    /// of the requester reachable via the interface serving `source_net`.
-    /// `parent` is the complete upstream lease and is stored with the route;
-    /// implementations return their own assignment (fresh local token, and
-    /// a `min_refresh_seconds` reduced by a margin so the downstream
-    /// refresh always lands inside the upstream refresh window).
+    /// of the requester `source_node`, reachable via the interface serving
+    /// `source_net`. `parent` is the complete upstream lease and is stored with
+    /// the route; implementations return their own assignment (fresh local
+    /// token, and a `min_refresh_seconds` reduced by a margin so the
+    /// downstream refresh always lands inside the upstream refresh window).
     fn register_delegated_seed_net(
         &mut self,
         source_net: u16,
+        source_node: u8,
         parent: &SeedLease,
     ) -> Result<SeedNetAssignment, SeedAssignmentError> {
-        _ = source_net;
+        _ = (source_net, source_node);
         _ = parent;
         Err(SeedAssignmentError::ProfileCantSeed)
     }
@@ -406,15 +450,19 @@ pub trait Profile {
     }
 
     /// Commit an upstream refresh: replace the stored parent lease, extend
-    /// the delegated route, and rotate the downstream token. The old token is
-    /// checked again so an async refresh cannot commit into a changed route.
+    /// the delegated route, rotate the downstream token, and take
+    /// `source_node` as the route's next hop (the token proves it is the
+    /// lease holder, so a requester that changed its node_id repairs the
+    /// route). The old token is checked again so an async refresh cannot
+    /// commit into a changed route.
     fn commit_delegated_refresh(
         &mut self,
         source_net: u16,
+        source_node: u8,
         refresh_token: [u8; 8],
         refreshed_parent: &SeedLease,
     ) -> Result<SeedNetAssignment, SeedRefreshError> {
-        _ = source_net;
+        _ = (source_net, source_node);
         _ = refresh_token;
         _ = refreshed_parent;
         Err(SeedRefreshError::ProfileCantSeed)
@@ -460,13 +508,18 @@ pub trait Profile {
         Err(SeedRefreshError::ProfileCantSeed)
     }
 
+    /// Refresh a root-owned seed assignment. On success `source_node` becomes
+    /// the route's next hop, as in [`commit_delegated_refresh`].
+    ///
+    /// [`commit_delegated_refresh`]: Profile::commit_delegated_refresh
     fn refresh_seed_net_assignment(
         &mut self,
         source_net: u16,
+        source_node: u8,
         refresh_net: u16,
         refresh_token: [u8; 8],
     ) -> Result<SeedNetAssignment, SeedRefreshError> {
-        _ = source_net;
+        _ = (source_net, source_node);
         _ = refresh_net;
         _ = refresh_token;
         Err(SeedRefreshError::ProfileCantSeed)
@@ -479,10 +532,41 @@ pub trait Interface {
     type Sink: InterfaceSink;
 }
 
+/// The segment node a frame is handed to on the link.
+#[cfg_attr(feature = "defmt-v1", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum LinkDst {
+    /// One node on this segment: the destination itself when it lives on the
+    /// segment, otherwise the next hop towards it.
+    Node(u8),
+    /// Every node on the segment.
+    Broadcast,
+}
+
+/// Link-layer addressing of one outgoing frame, decided by the profile.
+///
+/// The ergot header names the frame's end points, which may sit on other
+/// segments; this names the two ends of the hop over *this* link. A
+/// point-to-point link has one peer and ignores it. A shared-medium link
+/// (CAN, ESP-NOW, RS-485) addresses the frame with it: `src_node` is this
+/// device's node_id on the segment, `dst` who should take the frame.
+#[cfg_attr(feature = "defmt-v1", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct LinkMeta {
+    /// The node_id this device owns on the segment.
+    pub src_node: u8,
+    /// Who takes the frame.
+    pub dst: LinkDst,
+}
+
 /// The "Sink" side of the interface.
 ///
 /// This is typically held by a profile, and feeds data to the interface's
 /// TX worker.
+///
+/// Every send carries the frame's [`LinkMeta`]. Sinks for point-to-point
+/// links ignore it; sinks for shared-medium links use it to address the frame
+/// on the wire.
 #[allow(clippy::result_unit_err)]
 pub trait InterfaceSink {
     /// Returns the maximum total ergot packet size (header + payload) that this
@@ -492,9 +576,9 @@ pub trait InterfaceSink {
     /// the max reassembled size, not the raw link frame size.
     fn mtu(&self) -> u16;
 
-    fn send_ty<T: Serialize>(&mut self, hdr: &HeaderSeq, body: &T) -> Result<(), ()>;
-    fn send_raw(&mut self, hdr: &HeaderSeq, body: &[u8]) -> Result<(), ()>;
-    fn send_err(&mut self, hdr: &HeaderSeq, err: ProtocolError) -> Result<(), ()>;
+    fn send_ty<T: Serialize>(&mut self, link: &LinkMeta, hdr: &Header, body: &T) -> Result<(), ()>;
+    fn send_raw(&mut self, link: &LinkMeta, hdr: &Header, body: &[u8]) -> Result<(), ()>;
+    fn send_err(&mut self, link: &LinkMeta, hdr: &Header, err: ProtocolError) -> Result<(), ()>;
 }
 
 #[cfg_attr(feature = "defmt-v1", derive(defmt::Format))]
@@ -553,19 +637,28 @@ impl InterfaceState {
     /// receive worker, and the state to revert to when re-arming a quiet
     /// upstream so its transmit side stays ungated.
     pub const fn edge_link_local() -> Self {
-        InterfaceState::Active {
-            net_id: 0,
-            node_id: edge_port::EDGE_NODE_ID,
-        }
+        Self::link_local(edge_port::EDGE_NODE_ID)
+    }
+
+    /// [`Active`](InterfaceState::Active) with `net_id = 0` and the given
+    /// `node_id`: link-local addressing that keeps the device's identity on
+    /// its segment. [`edge_link_local`](Self::edge_link_local) is this with
+    /// the point-to-point [`EDGE_NODE_ID`](edge_port::EDGE_NODE_ID); a bus
+    /// device uses its claim candidate or claimed node_id instead.
+    pub const fn link_local(node_id: u8) -> Self {
+        InterfaceState::Active { net_id: 0, node_id }
     }
 }
 
 /// Configuration for opt-in liveness tracking.
 ///
 /// When enabled, the interface transitions on timeout:
-/// - **COBS stream transports** (TCP, serial, generic stream): transitions to
-///   [`InterfaceState::Inactive`]. Workers keep running and recover automatically
-///   when frames resume. Actual transport errors cause [`InterfaceState::Down`].
+/// - **COBS stream, packet and embassy-usb transports**: transitions to
+///   [`InterfaceState::Inactive`], or to link-local if the worker was built
+///   with `revert_to_link_local_on_timeout` (for an edge or bridge upstream,
+///   which has to keep sending to recover). Workers keep running and recover
+///   automatically when frames resume. Actual transport errors cause
+///   [`InterfaceState::Down`].
 /// - **UDP**: transitions to [`InterfaceState::Down`] and workers exit. UDP is
 ///   connectionless, so there is no persistent connection to recover — the socket
 ///   must be re-registered for the next session.
