@@ -160,6 +160,8 @@ pub mod embassy_usb_v0_6 {
 pub use embassy_net as embassy_net_v0_7;
 #[cfg(feature = "embassy-net-v0_9")]
 pub use embassy_net as embassy_net_v0_9;
+#[cfg(feature = "embassy-net-v0_10-preview")]
+pub use embassy_net as embassy_net_v0_10_preview;
 
 #[cfg(any(feature = "embassy-net-v0_7", feature = "embassy-net-v0_9"))]
 pub mod embassy_net {
